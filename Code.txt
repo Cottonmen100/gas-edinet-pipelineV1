@@ -1,3 +1,4 @@
+test
 /** ========= 設定 ========= **/
 const SHEET_CONFIG = 'Config';
 const SHEET_MAP    = 'Map';
@@ -197,3 +198,4 @@ function pickFirstAvailableNormalized_(obj, candidates, normalizeFn, _unused) {
   }
   return null;
 }
+
