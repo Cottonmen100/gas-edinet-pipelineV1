@@ -1,0 +1,2526 @@
+/***** ===== EDINET v2 minimal client for GAS (完全修正版) ===== *****/
+// ←ここに置く（EDINETの外）
+/** グローバル設定：四半期優先モード（デフォルトは年次） */
+var USE_QUARTERLY_MODE = true;
+// 必要なときだけ手動でON
+// USE_QUARTERLY_MODE = true;
+const EDINET = {
+
+  BASE: 'https://api.edinet-fsa.go.jp/api/v2',
+
+  getKey() {
+    return PropertiesService.getScriptProperties().getProperty('EDINET_API_KEY');
+  },
+
+  assertKey() {
+    const k = this.getKey();
+    if (!k) {
+      throw new Error('EDINET_API_KEY が未設定です。Apps Script → 歯車アイコン「プロジェクト設定」→ スクリプト プロパティで設定してください。');
+    }
+    return k;
+  },
+
+  /** 3-2 書類一覧API（documents.json） */
+  list(dateStr) {
+    const key = this.assertKey();
+    const date = dateStr || Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+    const url = `${this.BASE}/documents.json?date=${encodeURIComponent(date)}&type=2&Subscription-Key=${encodeURIComponent(key)}`;
+    const res = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true });
+    const status = res.getResponseCode();
+    const body = res.getContentText('UTF-8');
+
+    if (status === 401) throw new Error('EDINETのAPIキーが無効です（HTTP 401）。');
+    if (status === 404) {
+      // 当日未掲出（深夜・休業日など）は「空」で返す。上位で遡り処理。
+      return { metadata: { status: '404', message: 'Not Found', date: date }, results: [] };
+    }
+    if (status !== 200) {
+      throw new Error('一覧取得に失敗: HTTP ' + status + ' / ' + body.slice(0, 200));
+    }
+
+    const json = JSON.parse(body);
+    if (!json || !json.results) throw new Error('EDINET 応答が想定外です: ' + body.slice(0, 200));
+    return json; // {metadata, results:[...]}
+  },
+
+  /** 3-3 書類取得API（ZIP: type=1）→ Google Driveへ保存してURLを返す（従来の最小版） */
+  downloadZip(docID, filenameOpt) {
+    if (!docID) throw new Error('docID が未指定です。');
+    const key = this.assertKey();
+    const url = `${this.BASE}/documents/${encodeURIComponent(docID)}?type=1&Subscription-Key=${encodeURIComponent(key)}`;
+    const res = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true });
+    const status = res.getResponseCode();
+    if (status === 401) throw new Error('EDINETのAPIキーが無効です（HTTP 401）。');
+    if (status !== 200) throw new Error('ZIP取得に失敗: HTTP ' + status);
+
+    const blob = res.getBlob();
+    const name = (filenameOpt || `${docID}`) + '.zip';
+    blob.setName(name);
+    const file = DriveApp.createFile(blob); // 初回実行時はDrive権限が必要
+    return file.getUrl();
+  },
+
+  /** おまけ：一覧をシートに書き出す最小実装 */
+  writeListToNewSheet(dateStr) {
+    const date = dateStr || Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+    const sheetName = `EDINET_${date.replace(/-/g, '')}`;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+
+    const json = this.list(date);
+    const rows = json.results || [];
+
+    const header = [
+      'docID', 'edinetCode', 'filerName', 'docDescription', 'docTypeCode',
+      'submitDateTime', 'periodStart', 'periodEnd', 'issuerEdinetCode',
+      'securityCode', 'xbrlFlag'
+    ];
+    const data = [header];
+
+    rows.forEach(r => {
+      data.push([
+        r.docID || '',
+        r.edinetCode || '',
+        r.filerName || '',
+        r.docDescription || '',
+        r.docTypeCode || '',
+        r.submitDateTime || '',
+        r.periodStart || '',
+        r.periodEnd || '',
+        r.issuerEdinetCode || '',
+        r.securityCode || '',
+        r.xbrlFlag ? '1' : '0'
+      ]);
+    });
+
+    sheet.clearContents();
+    sheet.getRange(1, 1, data.length, header.length).setValues(data);
+    sheet.setFrozenRows(1);
+    sheet.autoResizeColumns(1, header.length);
+    return { sheetName, count: rows.length };
+  }
+};
+
+/***** ===== 機能追加（追記） ===== *****/
+
+/** 追加①: ZIPを保存して fileId も返す版（Drive連携時に便利） */
+EDINET.downloadZipWithId = function(docID, filenameOpt) {
+  if (!docID) throw new Error('docID が未指定です。');
+  const key = this.assertKey();
+  const url = `${this.BASE}/documents/${encodeURIComponent(docID)}?type=1&Subscription-Key=${encodeURIComponent(key)}`;
+  const res = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true });
+  const status = res.getResponseCode();
+  if (status === 401) throw new Error('EDINETのAPIキーが無効です（HTTP 401）。');
+  if (status !== 200) throw new Error('ZIP取得に失敗: HTTP ' + status);
+
+  const blob = res.getBlob();
+  const name = (filenameOpt || `${docID}`) + '.zip';
+  blob.setName(name);
+  const file = DriveApp.createFile(blob);
+  return { fileId: file.getId(), url: file.getUrl(), name };
+};
+
+/** 追加②: ZIP内のファイル名一覧を返す */
+EDINET.listZipEntries = function(fileId) {
+  if (!fileId) throw new Error('fileId が未指定です。');
+  const blobs = Utilities.unzip(DriveApp.getFileById(fileId).getBlob());
+  return blobs.map(b => b.getName());
+};
+
+/** 追加③: ZIPから .xbrl / .xml をテキスト配列で返す（{name,text}[]） */
+EDINET.unzipXbrlTextsFromFileId = function(fileId) {
+  if (!fileId) throw new Error('fileId が未指定です。');
+  const blobs = Utilities.unzip(DriveApp.getFileById(fileId).getBlob());
+  const out = [];
+  for (const b of blobs) {
+    const name = b.getName();
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.xbrl') || lower.endsWith('.xml')) {
+      let text;
+      try {
+        text = b.getDataAsString('UTF-8');  // まずUTF-8で試す
+      } catch (e) {
+        text = b.getDataAsString();         // ダメならデフォルト
+      }
+      out.push({ name, text });
+    }
+  }
+  if (out.length === 0) throw new Error('ZIP内に .xbrl / .xml が見つかりませんでした。');
+  return out;
+};
+
+/***** ===== 便利ヘルパー ===== *****/
+
+/** JSTのYYYY-MM-DDへ整形 */
+function formatYMD_(d) {
+  return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd');
+}
+
+/**
+ * 直近maxBack日を遡って xbrlFlag=1 の書類を探す
+ * @param {number} maxBack - 何日遡るか（例: 30）
+ * @param {string|null} startYmd - 開始日 'YYYY-MM-DD'。未指定なら今日
+ * @return {{dateUsed:string, doc:object}} 見つかった書類とその日付
+ */
+function findRecentDocWithXbrl(maxBack, startYmd) {
+  const max = maxBack || 14;
+  let d = startYmd ? new Date(startYmd + 'T00:00:00+09:00') : new Date();
+
+  for (let i = 0; i <= max; i++) {
+    const ymd = formatYMD_(d);
+    const list = EDINET.list(ymd); // 404はlist内で空配列として返ってくる
+    const hit = (list.results || []).find(r => r && r.xbrlFlag);
+    if (hit) return { dateUsed: ymd, doc: hit };
+    // 1日戻る
+    d = new Date(d.getTime() - 24 * 60 * 60 * 1000);
+  }
+  throw new Error('直近' + max + '日で xbrlFlag=1 の書類が見つかりませんでした。検索幅を広げてください。');
+}
+
+/** .xbrl/.xml 配列から “インスタンス文書” を優先して選ぶ */
+function pickPrimaryInstance(xbrls /* [{name,text},...] */) {
+  if (!xbrls || xbrls.length === 0) return null;
+
+  // まず .xbrl を最優先（リンクベース *_pre.xml, *_cal.xml などは除外）
+  const instXbrl = xbrls.find(f => /\.xbrl$/i.test(f.name));
+  if (instXbrl) return instXbrl;
+
+  // .xml の場合は manifest や *_pre.xml などを避ける
+  const xmlCandidates = xbrls.filter(f => /\.xml$/i.test(f.name));
+  const notManifest = xmlCandidates.filter(f => !/manifest/i.test(f.name));
+  const notLinkbase = notManifest.filter(f => !/_(pre|cal|lab|def)\.xml$/i.test(f.name));
+  return notLinkbase[0] || xmlCandidates[0] || xbrls[0];
+}
+
+/***** ===== 実行用テスト関数 ===== *****/
+
+/** 3-1: キーの読み込みテストだけ */
+function test_EdinetKey() {
+  const k = EDINET.getKey();
+  Logger.log('EDINET_API_KEY: ' + (k ? '(設定あり: 先頭4文字) ' + k.slice(0, 4) + '****' : '未設定'));
+}
+
+/** 3-2: 今日の一覧を取得 → 新しいシートへ書き出し */
+function test_ListToSheet_today() {
+  const result = EDINET.writeListToNewSheet(); // 今日
+  Logger.log(JSON.stringify(result));
+}
+
+/** 3-2: 任意の日付（YYYY-MM-DD）で一覧を取得 → 新しいシートへ書き出し */
+function test_ListToSheet_date() {
+  const result = EDINET.writeListToNewSheet('2025-10-01'); // 例（提出が多い日などに切替）
+  Logger.log(JSON.stringify(result));
+}
+
+/** 3-3: 直近の xbrlFlag=1 を自動探索 → ZIP→解凍→エントリ一覧→本体XBRLプレビュー */
+function test_DownloadAndInspect() {
+  const { dateUsed, doc } = findRecentDocWithXbrl(30, null); // 最大30日遡る
+  Logger.log('USING DATE: ' + dateUsed + ' / docID=' + doc.docID + ' / filer=' + (doc.filerName || ''));
+
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  Logger.log('ZIP saved: name=' + saved.name + ' url=' + saved.url + ' id=' + saved.fileId);
+
+  const entries = EDINET.listZipEntries(saved.fileId);
+  Logger.log('ZIP entries: ' + JSON.stringify(entries));
+
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  Logger.log('XBRL/XML files count=' + xbrls.length);
+
+  const primary = pickPrimaryInstance(xbrls);
+  if (!primary) throw new Error('XBRL/XMLが見つかりません。');
+  Logger.log('PRIMARY XBRL NAME: ' + primary.name);
+  Logger.log('PRIMARY PREVIEW (first 500 chars):\n' + primary.text.slice(0, 500));
+
+  // ルート要素の確認（XmlService抽出への布石）
+  try {
+    const docXml = XmlService.parse(primary.text);
+    const root = docXml.getRootElement();
+    Logger.log('ROOT ELEMENT: ' + root.getQualifiedName() + ' (ns: ' + root.getNamespace().getURI() + ')');
+  } catch (e) {
+    Logger.log('XML parse error: ' + e);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+/***** ===== 最小KPI抽出ユーティリティ ===== *****/
+
+/** XBRLテキスト → DOMにし、fact候補を平坦化して返す */
+function parseFactsFromXbrlText_(xbrlText) {
+  const doc  = XmlService.parse(xbrlText);
+  const root = doc.getRootElement();
+
+  const facts = [];            // ← これを追加
+
+  function walk(el) {
+    const children = el.getChildren();
+    if (children.length === 0) {
+      const txt = el.getText();
+      if (txt && txt.trim().length > 0) {
+        const qn = el.getQualifiedName(); // 例: jppfs_cor:NetSales
+        facts.push({
+          qname: qn,
+          localName: el.getName(), // 例: NetSales
+          nsUri: el.getNamespace().getURI(),
+          value: txt.trim(),
+          attrs: (() => {
+            const obj = {};
+            el.getAttributes().forEach(a => { obj[a.getName()] = a.getValue(); });
+            return obj; // decimals, unitRef, contextRef など
+          })()
+        });
+      }
+    } else {
+      // 子がある要素も、その要素自身にテキストがある場合は拾う（iXBRL／混在対策）
+      const own = el.getText();
+      if (own && own.trim().length > 0) {
+        const qn = el.getQualifiedName();
+        facts.push({
+          qname: qn,
+          localName: el.getName(),
+          nsUri: el.getNamespace().getURI(),
+          value: own.trim(),
+          attrs: (() => {
+            const obj = {};
+            el.getAttributes().forEach(a => { obj[a.getName()] = a.getValue(); });
+            return obj;
+          })()
+        });
+      }
+      children.forEach(walk);
+    }
+  }
+
+  walk(root);
+  return { doc, root, facts };
+}
+
+/** 日本語候補語 → 要素名パターン（英名）への簡易マップ（最初は粗くてOK、後で拡張） */
+function candidateWordToPatterns_(word) {
+  const w = String(word || '').trim();
+  // 例: 売上高→NetSales, 営業利益→OperatingIncome, 当期純利益→ProfitLoss, 総資産→TotalAssets
+  const table = {
+    '売上高': ['NetSales', 'Revenue', 'OperatingRevenues'],
+    '営業利益': ['OperatingIncome', 'OperatingProfit'],
+    '当期純利益': ['ProfitLoss', 'Profit', 'NetIncome'],
+    '総資産': ['TotalAssets'],
+    // 必要に応じて追加
+  };
+  return table[w] || [w]; // 未定義ならそのまま使う
+}
+
+/** facts配列から、localNameにパターンが含まれるものを拾う（大文字小文字無視） */
+function matchFactsByPatterns_(facts, patterns) {
+  const ps = (patterns || []).map(p => String(p).toLowerCase());
+  return facts.filter(f => ps.some(p => f.localName.toLowerCase().includes(p)));
+}
+
+/** 単位/小数点桁の解決は次段でやるので、まずは生値をログに出す最小版 */
+function test_ExtractSampleFacts() {
+  const { dateUsed, doc } = findRecentDocWithXbrl(30, null);
+  Logger.log('USING DATE: ' + dateUsed + ' / docID=' + doc.docID + ' / filer=' + (doc.filerName || ''));
+
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickPrimaryInstance(xbrls);
+  if (!primary) throw new Error('XBRL/XMLが見つかりません。');
+
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+  Logger.log('TOTAL FACTS (rough count): ' + facts.length);
+
+  // ★ここに“候補語”を並べる（まずは3つだけ）
+  const candidates = ['売上高', '営業利益', '当期純利益'];
+  candidates.forEach(word => {
+    const patterns = candidateWordToPatterns_(word);
+    const hits = matchFactsByPatterns_(facts, patterns);
+    Logger.log('--- ' + word + ' patterns=' + JSON.stringify(patterns));
+    if (hits.length === 0) {
+      Logger.log('  (該当なし)');
+    } else {
+      hits.slice(0, 5).forEach(h => {
+        Logger.log(
+          '  ' + h.qname + ' = ' + h.value +
+          '  [decimals=' + (h.attrs.decimals || '') +
+          ' unitRef=' + (h.attrs.unitRef || '') +
+          ' contextRef=' + (h.attrs.contextRef || '') + ']'
+        );
+      });
+      if (hits.length > 5) Logger.log('  ...and ' + (hits.length - 5) + ' more');
+    }
+  });
+}
+
+
+
+
+
+
+
+/** 事実のQName頻度TOPをログ出力 */
+function test_LogFactNamesTop() {
+  const { dateUsed, doc } = findRecentDocWithXbrl(30, null);
+  Logger.log('USING DATE: ' + dateUsed + ' / docID=' + doc.docID);
+
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickPrimaryInstance(xbrls);
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+
+  const freq = {};
+  facts.forEach(f => { freq[f.qname] = (freq[f.qname] || 0) + 1; });
+  const top = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,50);
+  Logger.log('TOP QNames:\n' + top.map(([k,v]) => (k + ' : ' + v)).join('\n'));
+}
+
+/** Factの生一覧をSheetへ（辞書拡張の素材） */
+function test_DumpFactsToSheet() {
+  const { dateUsed, doc } = findRecentDocWithXbrl(30, null);
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickPrimaryInstance(xbrls);
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+
+  const rows = [['QName','localName','nsURI','value','contextRef','unitRef','decimals']];
+  facts.forEach(f => rows.push([f.qname, f.localName, f.nsUri, f.value, f.attrs.contextRef||'', f.attrs.unitRef||'', f.attrs.decimals||'']));
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('Facts_Dump') || ss.insertSheet('Facts_Dump');
+  sh.clearContents();
+  sh.getRange(1,1,rows.length,rows[0].length).setValues(rows);
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, rows[0].length);
+  Logger.log('Dumped ' + (rows.length-1) + ' facts to Facts_Dump');
+}
+
+
+
+
+
+
+
+
+/** 説明文でXBRL書類をスクリーニング（有価証券報告書/決算短信） */
+function findDocWithXbrlByKeywords(keywords, maxBack) {
+  const max = maxBack || 90;
+  let d = new Date();
+  for (let i = 0; i <= max; i++) {
+    const ymd = formatYMD_(d);
+    const list = EDINET.list(ymd);
+    const hit = (list.results || []).find(r => r.xbrlFlag && keywords.some(k => (r.docDescription || '').indexOf(k) >= 0));
+    if (hit) return { dateUsed: ymd, doc: hit };
+    d = new Date(d.getTime() - 24 * 60 * 60 * 1000);
+  }
+  throw new Error('直近' + max + '日で該当書類が見つかりませんでした。');
+}
+
+
+
+
+
+
+
+/** XBRLから contextMap / unitMap を作る */
+function buildContextAndUnitMaps_(xbrlText) {
+  const doc = XmlService.parse(xbrlText);
+  const root = doc.getRootElement();
+  const nsX = XmlService.getNamespace('xbrli', 'http://www.xbrl.org/2003/instance');
+
+  // contexts
+  const contextMap = {};
+  root.getChildren('context', nsX).forEach(ctx => {
+    const id = ctx.getAttribute('id') && ctx.getAttribute('id').getValue();
+    if (!id) return;
+    const p = ctx.getChild('period', nsX);
+    let period = { type: 'unknown' };
+    const inst = p && p.getChildText('instant', nsX);
+    if (inst) {
+      period = { type: 'instant', instant: inst };
+    } else {
+      const s = p && p.getChildText('startDate', nsX);
+      const e = p && p.getChildText('endDate', nsX);
+      if (s || e) period = { type: 'duration', start: s || '', end: e || '' };
+    }
+    contextMap[id] = { period };
+  });
+
+  // units
+  const unitMap = {};
+  root.getChildren('unit', nsX).forEach(u => {
+    const id = u.getAttribute('id') && u.getAttribute('id').getValue();
+    if (!id) return;
+    const m = u.getChildText('measure', nsX);
+    if (m) {
+      unitMap[id] = { type: 'measure', measure: m };
+    } else {
+      const div = u.getChild('divide', nsX);
+      if (div) {
+        const num = div.getChild('unitNumerator', nsX);
+        const den = div.getChild('unitDenominator', nsX);
+        const numMeas = num ? num.getChildText('measure', nsX) : '';
+        const denMeas = den ? den.getChildText('measure', nsX) : '';
+        unitMap[id] = { type: 'divide', numerator: numMeas, denominator: denMeas };
+      } else {
+        unitMap[id] = { type: 'unknown' };
+      }
+    }
+  });
+  // ここまでが contextMap, unitMap のreturn直前
+  for (const key in contextMap) {
+    const c = contextMap[key];
+    if (c && c.period && c.period.start && c.period.end) {
+      const s = new Date(c.period.start);
+      const e = new Date(c.period.end);
+      const months = (e.getFullYear() - s.getFullYear()) * 12 + (e.getMonth() - s.getMonth()) + 1;
+      c.isQuarter = (months <= 4);  // 四半期とみなす
+    } else {
+      c.isQuarter = false;
+    }
+  }
+  return { contextMap, unitMap };
+}
+
+/** 文字列→数値（全角→半角、カンマ除去、( ) を負数扱い） */
+function toNumberLoose_(s) {
+  if (s == null) return null;
+  let t = String(s).trim();
+  t = t.replace(/[０-９．－，]/g, ch => {
+    const map = { '０':'0','１':'1','２':'2','３':'3','４':'4','５':'5','６':'6','７':'7','８':'8','９':'9','．':'.','－':'-','，':',' };
+    return map[ch] || ch;
+  });
+  t = t.replace(/,/g, '');
+  const neg = /^\(.*\)$/.test(t);
+  if (neg) t = t.replace(/[()]/g, '');
+  const n = Number(t);
+  return isFinite(n) ? (neg ? -n : n) : null;
+}
+
+/** decimals に従って丸め（"2"=小数2桁, "0"=整数, "-3"=千単位） */
+function applyDecimals_(num, decimals) {
+  if (num == null) return null;
+  if (!decimals || decimals === 'INF') return num;
+  const d = parseInt(decimals, 10);
+  if (!isFinite(d)) return num;
+  if (d >= 0) {
+    const f = Math.pow(10, d);
+    return Math.round(num * f) / f;
+  } else {
+    const f = Math.pow(10, -d);
+    return Math.round(num / f) * f;
+  }
+}
+
+/** 1件のfactを正規化（数値/単位/期間） */
+// === Add: 会計期ラベル推定 ===
+function inferQuarter_(startIso, endIso){
+  if (!endIso) return { fiscalYear:'', quarter:'', qLabel:'' };
+  const e = new Date(endIso);
+  const s = startIso ? new Date(startIso) : null;
+  const days = s ? Math.round((e - s)/86400000)+1 : NaN;
+  const fiscalYear = String(e.getFullYear());
+  // 期末月からQ推定（3,6,9,12を基準にする暫定ロジック）
+  const m = e.getMonth()+1;
+  let quarter = '';
+  if (isFinite(days) && days > 300) quarter = 'FY';
+  else if ([4,5,6].includes(m)) quarter = 'Q1';
+  else if ([7,8,9].includes(m)) quarter = 'Q2';
+  else if ([10,11,12].includes(m)) quarter = 'Q3';
+  else quarter = 'Q4';
+  const qLabel = quarter === 'FY' ? `${fiscalYear} 通期` : `${fiscalYear} ${quarter}`;
+  return { fiscalYear, quarter, qLabel };
+}
+
+// === Patch: normalizeFact_ の return を拡張 ===
+// （既存の関数本体はそのまま。最後の return だけ置換）
+function normalizeFact_(fact, contextMap, unitMap) {
+  const raw = toNumberLoose_(fact.value);
+  const num = applyDecimals_(raw, fact.attrs.decimals || '');
+  const u = unitMap[fact.attrs.unitRef || ''];
+  const unitText = u ? (u.type === 'measure' ? u.measure : u.type === 'divide' ? (u.numerator + '/' + u.denominator) : '') : '';
+  const c = contextMap[fact.attrs.contextRef || ''];
+  let periodText = '';
+  let fiscalYear = '', quarter = '', qLabel = '';
+  if (c) {
+    if (c.period.type === 'instant') {
+      periodText = c.period.instant;
+      const iq = inferQuarter_(null, c.period.instant);
+      fiscalYear = iq.fiscalYear; quarter = 'FY'; qLabel = iq.qLabel;
+    } else {
+      periodText = (c.period.start || '') + ' ~ ' + (c.period.end || '');
+      const iq = inferQuarter_(c.period.start, c.period.end);
+      fiscalYear = iq.fiscalYear; quarter = iq.quarter; qLabel = iq.qLabel;
+    }
+  }
+  return {
+    valueNum: num, unitText, periodText,
+    decimals: fact.attrs.decimals || '', contextRef: fact.attrs.contextRef || '', unitRef: fact.attrs.unitRef || '',
+    fiscalYear, quarter, qLabel
+  };
+}
+
+
+/** contextから年キー(YYYY)を取る */
+function yearKeyOfFact_(f, contextMap) {
+  const ctx = contextMap[f.attrs.contextRef || ''];
+  if (!ctx) return '';
+  const p = ctx.period;
+  const s = p.type === 'instant' ? p.instant : (p.end || '');
+  const m = s && s.match(/^(\d{4})-\d{2}-\d{2}$/);
+  return m ? m[1] : '';
+}
+
+/** contextから四半期キー(YYYY-Qn)を取る（非四半期は '' を返す） */
+function quarterKeyOfFact_(f, contextMap) {
+  const ctx = contextMap[f.attrs.contextRef || ''];
+  if (!ctx || !ctx.period || !ctx.period.end || !ctx.isQuarter) return '';
+  const d = new Date(ctx.period.end);
+  const y = d.getFullYear();
+  const q = Math.ceil((d.getMonth() + 1) / 3);
+  return `${y}-Q${q}`;
+}
+
+/** Periodキーのソート（YYYY も YYYY-Qn も昇順） */
+function comparePeriodKey_(a, b) {
+  const qa = /^(\d{4})-Q([1-4])$/i.exec(String(a));
+  const qb = /^(\d{4})-Q([1-4])$/i.exec(String(b));
+  if (qa && qb) {
+    const ya = +qa[1], qaN = +qa[2];
+    const yb = +qb[1], qbN = +qb[2];
+    return ya === yb ? qaN - qbN : ya - yb;
+  }
+  // 片方だけ四半期 → 年で比較、同年なら四半期を後ろに
+  if (qa || qb) {
+    const ya = qa ? +qa[1] : +String(a);
+    const yb = qb ? +qb[1] : +String(b);
+    if (ya !== yb) return ya - yb;
+    return qa ? -1 : 1;
+  }
+  // どちらも年だけ
+  return (+String(a)) - (+String(b));
+}
+
+// === Add: Tidy書き込み ===
+function writeFactsTidy_(rows, sheetName='facts_tidy'){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  if (sh.getLastRow() === 0){
+    sh.appendRow([
+      'edinetCode','filerName','docId','accountingStd','consolidated',
+      'periodType','periodStart','periodEnd','fiscalYear','quarter','qLabel',
+      'concept','valueNum','unitText','decimals','contextRef','unitRef','createdAt'
+    ]);
+  }
+  if (!rows || !rows.length) return;
+  const start = sh.getLastRow()+1;
+  sh.getRange(start,1,rows.length,rows[0].length).setValues(rows);
+}
+
+// === Add: KPI→タグ候補の辞書（最小セット。後で拡張OK） ===
+const METRIC_DICT = {
+  '売上高': ['ifrs:Revenue','jppfs_cor:NetSales','jpigp:NetSales','us-gaap:Revenues','SalesRevenue','RevenueFromContractsWithCustomers'],
+  '営業利益': ['jppfs_cor:OperatingIncome','ifrs-full:OperatingProfitLoss','OperatingProfit','us-gaap:OperatingIncomeLoss'],
+  '当期純利益': ['ifrs:ProfitLoss','jppfs_cor:ProfitLoss','ProfitLossAttributableToOwnersOfParent','us-gaap:NetIncomeLoss'],
+  '総資産': ['ifrs:Assets','jppfs_cor:TotalAssets','us-gaap:Assets'],
+  '純資産': ['ifrs:Equity','jppfs_cor:NetAssets','us-gaap:StockholdersEquity'],
+  '営業CF': ['ifrs:NetCashFlowsFromUsedInOperatingActivities','jppfs_cor:NetCashProvidedByUsedInOperatingActivities',
+             'us-gaap:NetCashProvidedByUsedInOperatingActivities'],
+  '投資CF': ['ifrs:NetCashFlowsFromUsedInInvestingActivities','jppfs_cor:NetCashProvidedByUsedInInvestingActivities'],
+  '財務CF': ['ifrs:NetCashFlowsFromUsedInFinancingActivities','jppfs_cor:NetCashProvidedByUsedInFinancingActivities']
+};
+
+// === Add: 概念インデックスを作る（高速化用） ===
+function buildConceptIndex_(facts){
+  const idx = {}; // { 'prefix:LocalName' or 'LocalName' -> [facts] }
+  for (const f of facts){
+    const key1 = f.qname || '';
+    const key2 = f.localName || '';
+    if (key1){ (idx[key1] = idx[key1] || []).push(f); }
+    if (key2){ (idx[key2] = idx[key2] || []).push(f); }
+  }
+  return idx;
+}
+
+// === Add: 候補タグから最適Factを選ぶ（連結優先・新しい期間優先） ===
+function pickBestFact_(conceptIndex, concepts, contextMap){
+  const basket = [];
+  for (const c of concepts || []){
+    const arr = conceptIndex[c] || conceptIndex[c.split(':').pop()] || [];
+    for (const f of arr) basket.push(f);
+  }
+  if (!basket.length) return null;
+  const score = (f)=>{
+    // 連結／最新期を優先（contextMapに periodEnd がある前提）
+    let s = 0;
+    const ctx = contextMap && contextMap[f.attrs && f.attrs.contextRef];
+    const end = ctx && ctx.period && (ctx.period.end || ctx.period.instant || '');
+    const isQ = ctx && ctx.isQuarter ? 1 : 0;
+    if (isQ) s += 1;
+    // 単純に日付文字列比較で“新しいほど高スコア”
+    s += end ? (parseInt((end||'').replace(/-/g,''),10)/1e8) : 0;
+    // 連結ヒント（contextRef名の文字を軽く見る）
+    const cref = String(f.attrs && f.attrs.contextRef || '').toLowerCase();
+    if (/consol|連結/.test(cref)) s += 5;
+    return s;
+  };
+  return basket.slice().sort((a,b)=>score(b)-score(a))[0];
+}
+
+function buildOutputRows_(facts, contextMap, unitMap) {
+  const want = ['売上高','営業利益','当期純利益','総資産','純資産','営業CF','投資CF','財務CF'];
+  const header = ['Period', ...want];
+  const rows = [header];
+
+  // ① KPIごとに「四半期」と「年」を同時にバケット
+  const perKpiQuarter = {};   // { KPI: { 'YYYY-Qn': [facts...] } }
+  const perKpiYear    = {};   // { KPI: { 'YYYY'   : [facts...] } }
+
+  const quarterKeys = new Set();  // すべての四半期キー
+  const yearKeys    = new Set();  // すべての年キー
+  const yearHasQuarter = new Set(); // 四半期が1つでも見つかった年（年フォールバック抑止用）
+
+  want.forEach(k => {
+    const hits = matchFactsByKpi_(facts, k);
+    const byQ = {};
+    const byY = {};
+
+    hits.forEach(h => {
+      const qKey = quarterKeyOfFact_(h, contextMap);
+      const yKey = yearKeyOfFact_(h, contextMap);
+
+      if (qKey) {
+        if (!byQ[qKey]) byQ[qKey] = [];
+        byQ[qKey].push(h);
+        quarterKeys.add(qKey);
+        yearHasQuarter.add(String(qKey).slice(0, 4)); // その年には四半期がある印
+      }
+      if (yKey) {
+        if (!byY[yKey]) byY[yKey] = [];
+        byY[yKey].push(h);
+        yearKeys.add(String(yKey));
+      }
+    });
+
+    perKpiQuarter[k] = byQ;
+    perKpiYear[k]    = byY;
+  });
+
+  // ② 出力するPeriodキーを決定
+  let finalKeySet;
+  if (USE_QUARTERLY_MODE) {
+    // まず全四半期を採用
+    finalKeySet = new Set([...quarterKeys]);
+    // その年に四半期が1つも無い場合だけ、年次をフォールバックで追加
+    yearKeys.forEach(y => {
+      if (!yearHasQuarter.has(String(y))) finalKeySet.add(String(y));
+    });
+  } else {
+    // 年次モードなら年だけ
+    finalKeySet = new Set([...yearKeys]);
+  }
+
+  const keys = Array.from(finalKeySet).sort(comparePeriodKey_);
+
+  // ③ 行の構築（キーが四半期か年かで参照先を切り替え）
+  keys.forEach(key => {
+    const isQuarter = /^(\d{4})-Q[1-4]$/i.test(String(key));
+    const rowObj = { Period: key };
+    want.forEach(k => {
+      const bucket = isQuarter ? perKpiQuarter[k] : perKpiYear[k];
+      const cands = (bucket && bucket[key]) || [];
+      if (cands.length) {
+        const best = (typeof EDIPH2 !== 'undefined' && EDIPH2 && EDIPH2.S && EDIPH2.S.chooseBestFact)
+          ? EDIPH2.S.chooseBestFact(cands, contextMap, {
+              preferConsolidated: true,
+              // 四半期キーのときだけ四半期優先ヒントを渡す
+              preferQuarterly: isQuarter
+            })
+          : cands[0];
+        const n = normalizeFact_(best, contextMap, unitMap);
+        rowObj[k] = n.valueNum;
+      } else {
+        rowObj[k] = '';
+      }
+    });
+    rows.push([rowObj.Period, ...want.map(k => rowObj[k])]);
+  });
+
+  // ④ セーフティ：四半期モードで行が全く出なかったら年次のみで再構築
+  if (USE_QUARTERLY_MODE && rows.length === 1 && yearKeys.size > 0) {
+    const onlyYears = Array.from(yearKeys).sort(comparePeriodKey_);
+    onlyYears.forEach(y => {
+      const rowObj = { Period: y };
+      want.forEach(k => {
+        const cands = (perKpiYear[k] && perKpiYear[k][y]) || [];
+        if (cands.length) {
+          const best = (typeof EDIPH2 !== 'undefined' && EDIPH2 && EDIPH2.S && EDIPH2.S.chooseBestFact)
+            ? EDIPH2.S.chooseBestFact(cands, contextMap, { preferConsolidated: true })
+            : cands[0];
+          const n = normalizeFact_(best, contextMap, unitMap);
+          rowObj[k] = n.valueNum;
+        } else {
+          rowObj[k] = '';
+        }
+      });
+      rows.push([rowObj.Period, ...want.map(k => rowObj[k])]);
+    });
+  }
+
+  return rows;
+}
+
+
+
+
+
+/** 企業分析レポート向けKPIパターン（ゆるめ一致） */
+const KPI_PATTERNS = {
+  '売上高': ['NetSales','Revenue','OperatingRevenues','SalesOfGoodsAndServices'],
+  '営業利益': ['OperatingIncome','OperatingProfit'],
+  '当期純利益': ['ProfitLoss','ProfitLossAttributableToOwnersOfParent','NetIncome'],
+  '総資産': ['TotalAssets'],
+  '純資産': ['NetAssets','Equity'],
+  '営業CF': ['CashFlowsFromOperatingActivities','NetCashProvidedByUsedInOperatingActivities'],
+  '投資CF': ['CashFlowsFromInvestingActivities','NetCashProvidedByUsedInInvestingActivities'],
+  '財務CF': ['CashFlowsFromFinancingActivities','NetCashProvidedByUsedInFinancingActivities']
+};
+function matchFactsByKpi_(facts, kpi) {
+  const ps = (KPI_PATTERNS[kpi] || []).map(s => s.toLowerCase());
+  return facts.filter(f => ps.some(p => f.localName.toLowerCase().includes(p)));
+}
+
+
+
+
+
+
+
+/** 有報/短信を探索→主要KPIを抽出→Output_Minに書き出し */
+function test_ExtractKPI_ToSheet() {
+  const { dateUsed, doc } = findDocWithXbrlByKeywords(['有価証券報告書','決算短信'], 90);
+  Logger.log('USING DATE: ' + dateUsed + ' / ' + (doc.docDescription || ''));
+
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickPrimaryInstance(xbrls);
+
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+  const { contextMap, unitMap } = buildContextAndUnitMaps_(primary.text);
+
+  // 年度キー（durationのendDate or instantからYYYY）
+  function yearOfFact_(f) {
+    const ctx = contextMap[f.attrs.contextRef || ''];
+    if (!ctx) return '';
+    const p = ctx.period;
+    const s = p.type === 'instant' ? p.instant : (p.end || '');
+    const m = s && s.match(/^(\d{4})-\d{2}-\d{2}$/);
+    return m ? m[1] : '';
+  }
+
+const want = ['売上高','営業利益','当期純利益','総資産','純資産','営業CF','投資CF','財務CF'];
+const rows = [['KPI','Year','QName','Value(raw)','Value(num)','Unit','Period','ContextRef','UnitRef']];
+
+want.forEach(k => {
+  const hits = matchFactsByKpi_(facts, k);
+  const byYear = {};
+  hits.forEach(h => {
+    const y = yearOfFact_(h);
+    if (!y) return;
+    if (!byYear[y]) byYear[y] = [];   // ← ここを互換記法に修正
+    byYear[y].push(h);
+  });
+  const years = Object.keys(byYear).sort();
+  if (years.length === 0) {
+    rows.push([k, '(not found)', '', '', '', '', '', '', '']);
+  } else {
+    years.forEach(y => {
+      const h = byYear[y][0]; // 暫定で先頭
+      const n = normalizeFact_(h, contextMap, unitMap);
+      rows.push([k, y, h.qname, h.value, n.valueNum, n.unitText, n.periodText, n.contextRef, n.unitRef]);
+    });
+  }
+});
+
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('Output_Min') || ss.insertSheet('Output_Min');
+  sh.clearContents();
+  sh.getRange(1,1,rows.length,rows[0].length).setValues(rows);
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, rows[0].length);
+  Logger.log('WROTE KPI rows: ' + (rows.length - 1));
+}
+
+
+/***** ===== EDINET Phase2 Extensions (append-only) ===== *****/
+const EDIPH2 = (() => {
+  // ── 安全ユーティリティ（既存構成に非干渉） ─────────────────────────
+  const S = {
+    getOrCreateSheet(name) {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const s = ss.getSheetByName(name);
+      return s || ss.insertSheet(name);
+    },
+    clearAndSetValues(sheet, values) {
+      sheet.clearContents().clearFormats();
+      if (!values || !values.length) return;
+      sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    },
+    // Output_Min の形状自動判定→正規化 { period -> { kpi -> number } }
+    readOutputMinNormalized(sheetName = 'Output_Min') {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const s = ss.getSheetByName(sheetName);
+      if (!s) throw new Error(`シート ${sheetName} が見つかりません`);
+      const rng = s.getDataRange();
+      const v = rng.getValues();
+      if (v.length < 2) throw new Error(`${sheetName} にデータがありません`);
+      const header = v[0].map(String);
+      const H = h => header.indexOf(h);
+      const lower = arr => arr.map(x => String(x).toLowerCase());
+
+      // パターンA: ワイド形式 例) [Period, 売上高, 営業利益, ...]
+      const hasPeriod = lower(header).includes('period') || lower(header).includes('会計期間');
+      const isWide = hasPeriod && header.length >= 3;
+      // パターンB: ロング形式 例) [period, kpi, value] または [会計期間, 指標, 値]
+      const lc = lower(header);
+      const isLong = (lc.includes('period') || lc.includes('会計期間'))
+        && (lc.includes('kpi') || lc.includes('指標'))
+        && (lc.includes('value') || lc.includes('値'));
+
+      const data = {};
+      if (isWide) {
+        const periodIdx = lc.indexOf('period') >= 0 ? lc.indexOf('period') : lc.indexOf('会計期間');
+        for (let i = 1; i < v.length; i++) {
+          const row = v[i];
+          const period = String(row[periodIdx]);
+          if (!period) continue;
+          data[period] = data[period] || {};
+          for (let c = 0; c < header.length; c++) {
+            if (c === periodIdx) continue;
+            const kpi = String(header[c]).trim();
+            const val = Number(row[c]);
+            if (!isNaN(val)) data[period][kpi] = val;
+          }
+        }
+      } else if (isLong) {
+        const periodIdx = lc.indexOf('period') >= 0 ? lc.indexOf('period') : lc.indexOf('会計期間');
+        const kpiIdx    = lc.indexOf('kpi')    >= 0 ? lc.indexOf('kpi')    : lc.indexOf('指標');
+        const valIdx    = lc.indexOf('value')  >= 0 ? lc.indexOf('value')  : lc.indexOf('値');
+        for (let i = 1; i < v.length; i++) {
+          const period = String(v[i][periodIdx]);
+          const kpi    = String(v[i][kpiIdx]).trim();
+          const val    = Number(v[i][valIdx]);
+          if (!period || !kpi || isNaN(val)) continue;
+          data[period] = data[period] || {};
+          data[period][kpi] = val;
+        }
+      } else {
+        throw new Error('Output_Min の列構造が特定できません（ワイド or ロングの想定外）');
+      }
+      return data;
+    },
+    // ヘルパ: 百万円(=1e6)丸め
+    toMillions(x) {
+      if (x == null || x === '') return '';
+      const n = Number(x);
+      if (isNaN(n)) return '';
+      return n / 1e6;
+    },
+    // 会計期間からFYラベルを作る。引数: 期末日(Date) と 期末月(1-12) → "FY2025 (03月期)" 等
+    makeFYLabel(endDate, fiscalMonth) {
+      const y = endDate.getFullYear();
+      const m = endDate.getMonth() + 1;
+      // 日本のFY表現は「期末月の年をFY」とするのが一般的（例: 2025/03期 → FY2025）
+      const fy = (m === fiscalMonth) ? y : (m < fiscalMonth ? y : y); // 期末月で切るため実質 y
+      const mm = ('0' + fiscalMonth).slice(-2);
+      return `FY${fy}（${mm}月期）`;
+    },
+    // parse context（"連結"優先）の簡易ルール（XBRL facts 配列を仮定）
+// 置換対象：EDIPH2 内の S.chooseBestFact 全体
+chooseBestFact(facts, contextOrOpts, maybeOpts) {
+  if (!Array.isArray(facts) || facts.length === 0) return null;
+
+  // --- 後方互換のための引数ハンドリング ---
+  // パターンA: chooseBestFact(facts, contextMap, { ...opts })
+  // パターンB: chooseBestFact(facts, { ...opts })  // 旧シグネチャ
+  let contextMap = null;
+  let opts = {};
+  if (contextOrOpts && typeof contextOrOpts === 'object' && contextOrOpts.contextMap) {
+    // 将来の柔軟性のために contextMap を opts.contextMap として受けてもOKにする
+    contextMap = contextOrOpts.contextMap;
+    opts = { ...(maybeOpts || {}) };
+  } else if (contextOrOpts && typeof contextOrOpts === 'object' && !maybeOpts) {
+    // 旧: 第二引数がそのままoptsだった場合
+    opts = { ...contextOrOpts };
+  } else {
+    // 新: 第二引数=contextMap、第三引数=opts
+    contextMap = contextOrOpts || null;
+    opts = { ...(maybeOpts || {}) };
+  }
+
+  const { preferConsolidated = true, preferQuarterly = false } = opts;
+
+// --- まず四半期優先の分岐（contextMapがあるときだけ有効） ---
+if (preferQuarterly && contextMap) {
+  const quarters = facts
+    .map(f => {
+      const ctx = contextMap[f.attrs && f.attrs.contextRef];
+      if (!ctx || !ctx.isQuarter) return null;
+      const pe  = ctx.period ? (ctx.period.end || ctx.period.instant || '') : '';
+      const key = pe ? Number(String(pe).replace(/[^\d]/g, '')) : 0; // YYYYMMDD を数値化
+      return { f, key };
+    })
+    .filter(x => x)
+    .sort((a, b) => b.key - a.key); // 期末日の新しい順に
+
+  if (quarters.length) return quarters[0].f; // 最新四半期を返す
+}
+
+
+  // --- 既存の連結優先スコアリング ---
+  const score = f => {
+    let s = 0;
+    const c = (String(f.contextEntity || '') + String(f.contextLabel || '')).toLowerCase();
+    if (preferConsolidated && /consolidated|連結/.test(c)) s += 10;
+    if (/current|当期|present/.test(String(f.period || '').toLowerCase())) s += 3;
+    if (/audited|監査/.test(c)) s += 1;
+    if (/restated|修正/.test(c)) s -= 2;
+    return s;
+  };
+  return facts.slice().sort((a,b)=>score(b)-score(a))[0];
+}
+  };
+
+  // ── 1) KPI辞書拡張（PL/BS/CF + FCF計算） ──────────────────────────
+  //    ・XBRLタグのゆらぎに強い「ラベル候補」ベース
+  //    ・見つからなければ代替式で算定（例: 売上総利益 = 売上高 - 売上原価）
+  const KPI_DICT = {
+    // 既存に加えて追加（表記は Output_Min の既存キーに合わせて調整してOK）
+    '売上総利益': {
+      labels: ['GrossProfit', 'Gross profit', '売上総利益', '粗利益'],
+      fallback: (m) => {
+        const s = m['売上高'] ?? m['営業収益'];
+        const c = m['売上原価'] ?? m['売上原価（Cost of Sales）'];
+        if (isNum(s) && isNum(c)) return s - c;
+        return null;
+      }
+    },
+    '経常利益': {
+      labels: ['OrdinaryIncome', 'RecurringProfit', '経常利益'],
+      fallback: (m) => null
+    },
+    '負債合計': {
+      labels: ['TotalLiabilities', 'Liabilities', '負債合計'],
+      fallback: (m) => null
+    },
+    '期末現金同等物': {
+      labels: ['CashAndCashEquivalentsAtEndOfPeriod', '現金及び現金同等物期末残高', '期末現金同等物'],
+      fallback: (m) => null
+    },
+    // FCFは算定のみ（厳密には定義揺れがあるが、実務では 営業CF - 投資CF を基本形とする）
+    'フリーキャッシュフロー': {
+      labels: [],
+      fallback: (m) => {
+        const ocf = pickAny(m, ['営業CF', '営業活動によるキャッシュ・フロー', '営業活動によるキャッシュフロー']);
+        const icf = pickAny(m, ['投資CF', '投資活動によるキャッシュ・フロー', '投資活動によるキャッシュフロー']);
+        if (isNum(ocf) && isNum(icf)) return ocf - icf;
+        return null;
+      }
+    }
+  };
+
+  function isNum(x){ return typeof x === 'number' && !isNaN(x); }
+  function pickAny(obj, keys){ for (const k of keys){ if (isNum(obj[k])) return obj[k]; } return null; }
+
+  // 既存の抽出結果（Output_Min）へ不足KPIを補完するための“再抽出/再計算”
+  function extendAndRebuildOutputMin({ sourceSheet = 'Output_Min', destSheet = 'Output_Min' } = {}) {
+    const map = S.readOutputMinNormalized(sourceSheet); // { period: {kpi:value} }
+    const periods = Object.keys(map).sort();            // 並びはお好みで
+
+    // 各期に対して辞書で不足分を補完
+    for (const p of periods) {
+      const row = map[p];
+      // ラベル候補から拾う関数（既存 Output_Min に類似KPIがあれば採用）
+      for (const kpiName of Object.keys(KPI_DICT)) {
+        if (isNum(row[kpiName])) continue; // 既にあるなら保持
+        const def = KPI_DICT[kpiName];
+        let found = null;
+        for (const lab of def.labels) {
+          if (isNum(row[lab])) { found = row[lab]; break; }
+        }
+        if (found == null && typeof def.fallback === 'function') {
+          found = def.fallback(row);
+        }
+        if (isNum(found)) row[kpiName] = found;
+      }
+    }
+
+    // ワイド形式で再出力（既存シートに上書きするが“列名は追記型”）
+    const allKpis = new Set();
+    periods.forEach(p => Object.keys(map[p]).forEach(k => allKpis.add(k)));
+    const headers = ['Period', ...Array.from(allKpis)];
+    const values = [headers];
+    for (const p of periods) {
+      const row = [p];
+      for (let i = 1; i < headers.length; i++) {
+        const k = headers[i];
+        row.push(isNum(map[p][k]) ? map[p][k] : '');
+      }
+      values.push(row);
+    }
+    const s = S.getOrCreateSheet(destSheet);
+    S.clearAndSetValues(s, values);
+    return { periods, kpis: headers.slice(1) };
+  }
+
+  // ── 2) 年度ラベル（FY整形）＋ 3) View（百万円）生成 ──────────────────
+  function buildOutputMinView({
+    sourceSheet = 'Output_Min',
+    destSheet   = 'Output_Min_View',
+    fiscalMonth = 3 // 期末月（例: 3月期なら 3）
+  } = {}) {
+    const map = S.readOutputMinNormalized(sourceSheet);
+    const periods = Object.keys(map).sort();
+
+    // Period は一般に日付 or 期末日文字列想定。安全側に変換を試みる。
+const periodToDate = (p) => {
+  const s = String(p);
+
+  // 追加: YYYY-Qn を期末月最終日にマップ（Q1→3月, Q2→6月, Q3→9月, Q4→12月）
+  const mq = s.match(/^(\d{4})-Q([1-4])$/i);
+  if (mq) {
+    const y = Number(mq[1]);
+    const q = Number(mq[2]);
+    const month = q * 3; // 3,6,9,12
+    return new Date(y, month, 0); // 当月0日=前月末 → monthが3なら3月末
+  }
+
+  // 代表的な日付形式: '2025-03-31' / '2025/03/31' / '20250331'
+  const t = s.replace(/[^\d]/g,'');
+  if (t.length >= 8) {
+    const y = Number(t.slice(0,4)), m = Number(t.slice(4,6)), d = Number(t.slice(6,8));
+    return new Date(y, m-1, d);
+  }
+  // 年のみっぽい場合は期末月の末日に倒す
+  if (/^\d{4}$/.test(s)) {
+    const y = Number(s);
+    return new Date(y, fiscalMonth, 0);
+  }
+  // 最後の保険
+  const y = (new Date()).getFullYear();
+  return new Date(y, fiscalMonth, 0);
+};
+
+    // ヘッダ収集
+    const allKpis = new Set();
+    periods.forEach(p => Object.keys(map[p]).forEach(k => allKpis.add(k)));
+    const kpis = Array.from(allKpis);
+
+    const values = [['FY', ...kpis.map(k=>`${k}（百万円）`)]];
+    for (const p of periods) {
+      const end = periodToDate(p);
+      const fy  = S.makeFYLabel(end, fiscalMonth);
+      const row = [fy];
+      for (const k of kpis) {
+        row.push(S.toMillions(map[p][k]));
+      }
+      values.push(row);
+    }
+
+    const s = S.getOrCreateSheet(destSheet);
+    S.clearAndSetValues(s, values);
+    // 右寄せ数値書式
+    if (values.length > 1 && values[0].length > 1) {
+      s.getRange(2, 2, values.length-1, values[0].length-1).setNumberFormat('#,##0.0');
+      s.getRange(2, 2, values.length-1, values[0].length-1).setHorizontalAlignment('right');
+    }
+    return { periods, kpis, fiscalMonth };
+  }
+
+  // ── 4) 比率シート Output_Ratios ────────────────────────────────────
+  // 必要項目が無い期は空欄のまま。安全第一でゼロ除算回避。
+  function buildOutputRatios({
+    sourceViewSheet = 'Output_Min_View',
+    destSheet       = 'Output_Ratios'
+  } = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const s  = ss.getSheetByName(sourceViewSheet);
+    if (!s) throw new Error(`${sourceViewSheet} が見つかりません`);
+
+    const v = s.getDataRange().getValues();
+    const header = v[0];
+    // KPI列名の逆引き
+    const idx = name => header.indexOf(name);
+    const findIdxLike = (keys) => {
+      for (const h of header) {
+        for (const key of keys) {
+          if (String(h).includes(key)) return header.indexOf(h);
+        }
+      }
+      return -1;
+    };
+
+    const iFY   = idx('FY');
+
+    // 営業利益率 = 営業利益 / 売上高
+    const iSalesMM   = findIdxLike(['売上高（百万円）','営業収益（百万円）']);
+    const iOpIncMM   = findIdxLike(['営業利益（百万円）']);
+    // ROE = 当期純利益 / 自己資本
+    const iNI_MM     = findIdxLike(['当期純利益（百万円）','親会社株主に帰属する当期純利益（百万円）']);
+    const iEquityMM  = findIdxLike(['自己資本（百万円）','純資産（百万円）','株主資本（百万円）']);
+    // ROA = 当期純利益 / 総資産
+    const iAssetsMM  = findIdxLike(['総資産（百万円）','資産合計（百万円）']);
+    // 自己資本比率 = 自己資本 / 総資産
+    // FCF（百万円）は View に「フリーキャッシュフロー（百万円）」がある前提（辞書で作成）
+    const iFCFMM     = findIdxLike(['フリーキャッシュフロー（百万円）']);
+
+    const out = [['FY','営業利益率','ROE','ROA','自己資本比率','FCF（百万円）']];
+    for (let r = 1; r < v.length; r++) {
+      const row = v[r];
+      const get = (i)=> (i>=0 ? Number(row[i]) : NaN);
+
+      const sales = get(iSalesMM), op = get(iOpIncMM), ni = get(iNI_MM),
+            eq = get(iEquityMM), assets = get(iAssetsMM), fcf = get(iFCFMM);
+
+      const safeDiv = (a,b)=> (isFinite(a)&&isFinite(b)&&b!==0 ? a/b : '');
+      const opMargin = safeDiv(op, sales);
+      const roe      = safeDiv(ni, eq);
+      const roa      = safeDiv(ni, assets);
+      const eqRatio  = safeDiv(eq, assets);
+
+      out.push([
+        row[iFY],
+        isFinite(opMargin)? opMargin : '',
+        isFinite(roe)? roe : '',
+        isFinite(roa)? roa : '',
+        isFinite(eqRatio)? eqRatio : '',
+        isFinite(fcf)? fcf : ''
+      ]);
+    }
+
+    const d = S.getOrCreateSheet(destSheet);
+    S.clearAndSetValues(d, out);
+    if (out.length > 1) {
+      d.getRange(2, 2, out.length-1, 4).setNumberFormat('0.0%'); // 率
+      d.getRange(2, 6, out.length-1, 1).setNumberFormat('#,##0.0'); // FCF 金額
+      d.getRange(2, 2, out.length-1, 5).setHorizontalAlignment('right');
+    }
+  }
+
+  // ── 5) テンプレート転記 ─────────────────────────────────────────
+  // 例: fillReportTemplate_({ template: 'Report_Template', view: 'Output_Min_View', ratios: 'Output_Ratios' })
+  function fillReportTemplate_({
+    template = 'Report_Template',
+    view     = 'Output_Min_View',
+    ratios   = 'Output_Ratios'
+  } = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sT = ss.getSheetByName(template);
+    if (!sT) throw new Error(`テンプレート ${template} が見つかりません`);
+    const sV = ss.getSheetByName(view);
+    const sR = ss.getSheetByName(ratios);
+    if (!sV || !sR) throw new Error('View または Ratios がまだ生成されていません');
+
+    // 単純な「表貼り付け」パターン（テンプレ側の名前付き範囲に流し込むならここを調整）
+    const vData = sV.getDataRange().getValues();
+    const rData = sR.getDataRange().getValues();
+
+    // 例: テンプレの A1 起点に View、A20 起点に Ratios を貼る
+    {
+      const h = vData.length, w = vData[0].length;
+      sT.getRange(1,1,h,w).clearContent().setValues(vData);
+    }
+    {
+      const h = rData.length, w = rData[0].length;
+      sT.getRange(20,1,h,w).clearContent().setValues(rData);
+    }
+  }
+
+  // ── 6) 便利な“段階実行”エントリ ─────────────────────────────────
+  // 1. 辞書拡張→再抽出
+  function step1_extendAndRebuild() {
+    return extendAndRebuildOutputMin();
+  }
+  // 2. View 生成（FY表記/百万円）
+  function step2_buildView({ fiscalMonth = 3 } = {}) {
+    return buildOutputMinView({ fiscalMonth });
+  }
+  // 3. 指標シート
+  function step3_buildRatios() {
+    return buildOutputRatios();
+  }
+  // 4. テンプレ転記
+  function step4_fillTemplate({ template = 'Report_Template' } = {}) {
+    return fillReportTemplate_({ template });
+  }
+
+return {
+  S,  // ← これを追加
+  step1_extendAndRebuild,
+  step2_buildView,
+  step3_buildRatios,
+  step4_fillTemplate
+};
+})();
+/***** === Phase2: 可視化テンプレ＆自動コメント（append-only） === *****/
+(function(){
+  // レポート一括実行: Step1→2→3→テンプレ貼付→グラフ→コメント
+  function buildFullReport_({ template='Report_Template', fiscalMonth=3 } = {}) {
+    // 既存パイプライン
+    EDIPH2.step1_extendAndRebuild();
+    EDIPH2.step2_buildView({ fiscalMonth });
+    EDIPH2.step3_buildRatios();
+    EDIPH2.step4_fillTemplateAuto({ template });
+
+    // グラフ & コメント
+    createOrUpdateReportSheet_({ template });
+    writeAutoComments_({ template });
+  }
+
+  // テンプレにグラフを作る
+  function createOrUpdateReportSheet_({ template='Report_Template' } = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(template) || ss.insertSheet(template);
+
+    const view = ss.getSheetByName('Output_Min_View');
+    const ratios = ss.getSheetByName('Output_Ratios');
+    if (!view || !ratios) throw new Error('View/Ratios がありません（Step2/Step3未実行）');
+
+    // 既存チャートは一旦削除（再生成）
+    sh.getCharts().forEach(c => sh.removeChart(c));
+
+    // View: FY列＋主要KPI列のインデックス取得
+    const v = view.getDataRange().getValues();
+    const vh = v[0].map(String);
+    const idx = h => vh.indexOf(h);
+    const fyCol = 1; // A=1
+    const findLike = kw => {
+      for (let c=0;c<vh.length;c++){
+        if (String(vh[c]).includes(kw)) return c+1; // 1-based
+      }
+      return -1;
+    };
+    const colSales = findLike('売上高（百万円）');
+    const colOp    = findLike('営業利益（百万円）');
+    const colFCF   = findLike('フリーキャッシュフロー（百万円）');
+
+    const vRows = v.length;
+    // A: 売上＆営業利益（折れ線・複合）
+    if (colSales>0 && colOp>0) {
+      const chart1 = sh.newChart()
+        .asLineChart()
+        .addRange(view.getRange(1, 1, vRows, 1))              // FY
+        .addRange(view.getRange(1, colSales, vRows, 1))       // 売上
+        .addRange(view.getRange(1, colOp,    vRows, 1))       // 営業利益
+        .setPosition(1, 8, 0, 0)                              // H1 付近
+        .setOption('title', '売上高・営業利益（百万円）')
+        .build();
+      sh.insertChart(chart1);
+    }
+
+    // B: FCF（棒）
+    if (colFCF>0) {
+      const chart2 = sh.newChart()
+        .asColumnChart()
+        .addRange(view.getRange(1, 1, vRows, 1))              // FY
+        .addRange(view.getRange(1, colFCF, vRows, 1))         // FCF
+        .setPosition(16, 8, 0, 0)                             // H16 付近
+        .setOption('title', 'フリーキャッシュフロー（百万円）')
+        .build();
+      sh.insertChart(chart2);
+    }
+
+    // Ratios: 利益率・ROE・ROA・自己資本比率（折れ線）
+    const r = ratios.getDataRange().getValues();
+    const rr = ratios.getDataRange();
+    const rRows = r.length;
+    const H = r[0].map(String);
+    const ridx = name => H.indexOf(name)+1; // 1-based
+    const iFY = ridx('FY'), iOpm = ridx('営業利益率'), iROE = ridx('ROE'), iROA = ridx('ROA'), iEq = ridx('自己資本比率');
+    if (iFY>0 && iOpm>0 && iROE>0) {
+      const chart3 = sh.newChart()
+        .asLineChart()
+        .addRange(ratios.getRange(1, iFY,  rRows, 1))
+        .addRange(ratios.getRange(1, iOpm, rRows, 1))
+        .addRange(ratios.getRange(1, iROE, rRows, 1))
+        .addRange(iROA>0 ? ratios.getRange(1, iROA, rRows, 1) : ratios.getRange(1, iEq, rRows, 1))
+        .setPosition(31, 8, 0, 0)                             // H31 付近
+        .setOption('title', '主要比率（営業利益率・ROE・ROA/自己資本比率）')
+        .build();
+      sh.insertChart(chart3);
+    }
+  }
+
+  // Output_Scores を読み、短い根拠コメントを作ってテンプレへ出力
+// 置換版：より人間味のある自動コメント
+function writeAutoComments_({ template='Report_Template' } = {}) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sScore = ss.getSheetByName('Output_Scores');
+  const sView  = ss.getSheetByName('Output_Min_View');
+  const sRat   = ss.getSheetByName('Output_Ratios');
+  const sT     = ss.getSheetByName(template) || ss.insertSheet(template);
+  if (!sScore || !sView || !sRat) return;
+
+  // --- 評点の読み込み ---
+  const scoreMap = Object.fromEntries(
+    sScore.getDataRange().getValues()
+      .slice(1)
+      .filter(r => r[0])
+      .map(r => [String(r[0]), String(r[1])])
+  );
+
+  // 赤旗
+  const redFlag = scoreMap['赤旗'] && scoreMap['赤旗'] !== '(なし)' ? String(scoreMap['赤旗']) : '';
+
+  // --- 直近FYの主要値 ---
+  const V = sView.getDataRange().getValues();
+  const VH = V[0].map(String);
+  const findLike = kw => {
+    for (let i=0;i<VH.length;i++) if (String(VH[i]).includes(kw)) return i;
+    return -1;
+  };
+  const iFY    = 0;
+  const iSales = findLike('売上高（百万円）');
+  const iOp    = findLike('営業利益（百万円）');
+  const last   = V[V.length-1] || [];
+  const lastFY   = last[iFY] || '';
+  const lastSales= iSales>=0 ? Number(last[iSales]) : NaN;
+  const lastOp   = iOp>=0    ? Number(last[iOp])    : NaN;
+
+  // --- 直近の比率 ---
+  const R = sRat.getDataRange().getValues();
+  const RH = R[0].map(String);
+  const id = n => RH.indexOf(n);
+  const rLast = R[R.length-1] || [];
+  const roe = Number(rLast[id('ROE')]);
+  const opm = Number(rLast[id('営業利益率')]);
+  const roa = Number(rLast[id('ROA')]);
+  const eqr = Number(rLast[id('自己資本比率')]);
+
+  // --- 言い回しヘルパ ---
+  const phrase = g => (
+    g === 'A' ? 'とても良い' :
+    g === 'B' ? '良好' :
+    g === 'C' ? 'おおむね並み' :
+    g === 'D' ? '慎重さが必要' :
+    g === 'E' ? '厳しめ' : '—'
+  );
+  const pct = x => isFinite(x) ? (x*100).toFixed(1) + '%' : '—';
+  const num = x => isFinite(x) ? Math.round(x).toLocaleString() : '—';
+
+  // --- 文章生成（短文で箇条書き） ---
+  const lines = [];
+  lines.push('【自動サマリー】');
+  if (lastFY) {
+    lines.push(`・直近期（${lastFY}）の規模感は、売上 ${num(lastSales)} 百万円、営業利益 ${num(lastOp)} 百万円。`);
+  }
+  if (scoreMap['成長性']) {
+    lines.push(`・成長性は「${scoreMap['成長性']}」評価。中期での売上・営業利益の伸びから見て ${phrase(scoreMap['成長性'])} 印象です。`);
+  }
+  if (scoreMap['収益性']) {
+    lines.push(`・収益性は「${scoreMap['収益性']}」。足元の営業利益率 ${pct(opm)}、ROE ${pct(roe)}。収益力の輪郭はこの水準。`);
+  }
+  if (scoreMap['財務健全性']) {
+    lines.push(`・財務健全性は「${scoreMap['財務健全性']}」。自己資本比率 ${pct(eqr)}、ROA ${pct(roa)}。攻めと守りのバランスに${phrase(scoreMap['財務健全性'])}。`);
+  }
+  if (scoreMap['資産割安性'] || scoreMap['収益割安性']) {
+    const a = scoreMap['資産割安性'] || '—', e = scoreMap['収益割安性'] || '—';
+    lines.push(`・バリュエーションの手触り：資産割安性「${a}」、収益割安性「${e}」。定義は簡易だが目安として。`);
+  }
+  if (scoreMap['株主重視姿勢']) {
+    lines.push(`・株主重視姿勢は「${scoreMap['株主重視姿勢']}」。配当やCFの余力を総合しての一次評価。`);
+  }
+  if (redFlag) {
+    lines.push(`・注意：${redFlag}。ここは原典（開示）での確認推奨。`);
+  } else {
+    lines.push('・特記事項：目立つ赤旗は検出されていません。');
+  }
+
+  // --- 出力（テンプレ A40〜） ---
+  const startRow = 40;
+  sT.getRange(startRow, 1, lines.length, 1).setValues(lines.map(x=>[x]));
+  sT.getRange(startRow, 1, lines.length, 1).setWrap(true);
+}
+
+
+  // ランナー公開
+  if (!EDIPH2.step6_buildFullReport){
+    EDIPH2.step6_buildFullReport = buildFullReport_;
+  }
+})();
+
+/*** === メニューにレポート一発生成を追加（append-only） === ***/
+function Phase2_Step6_BuildFullReport() {
+  // fiscalMonth は必要に応じて 12 などに変更
+  EDIPH2.step6_buildFullReport({ fiscalMonth: 3, template: 'Report_Template' });
+}
+
+// === PhaseB: 7項目スコア（5年CAGR版）を Output_Scores に出力 =================
+(function(){
+  const GRADE_BANDS = { A:0.85, B:0.70, C:0.55, D:0.40, E:0.00 };
+  const clip = (x,lo=0,hi=1)=> Math.max(lo, Math.min(hi, x));
+  const safeDiv = (a,b)=> (isFinite(a)&&isFinite(b)&&b!==0 ? a/b : null);
+
+  // 有効値末尾から N年分でCAGR。データ不足なら短い年数に自動フォールバック
+  function cagrN(arr, nYears){
+    const xs = arr.filter(v => isFinite(v) && v > 0);
+    if (xs.length < 2) return null;
+    const use = xs.slice(-Math.max(2, Math.min(nYears, xs.length)));
+    const first = use[0], last = use[use.length-1];
+    const n = use.length - 1;
+    return Math.pow(last/first, 1/n) - 1;
+  }
+
+  // シートから系列を拾う
+  function pickSeries_(sheetName, labelContains){
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const s = ss.getSheetByName(sheetName);
+    if (!s) throw new Error(`${sheetName} が見つかりません`);
+    const v = s.getDataRange().getValues();
+    const header = v[0].map(String);
+    const idxFY = header.indexOf('FY');
+    const col = header.findIndex(h => String(h).includes(labelContains));
+    const fy = [], vals = [];
+    if (idxFY < 0 || col < 0) return { fy, vals };
+    for (let r=1; r<v.length; r++){
+      const y = String(v[r][idxFY] || '');
+      const num = Number(v[r][col]);
+      if (!y) continue;
+      fy.push(y);
+      vals.push(isFinite(num) ? num : NaN);
+    }
+    return { fy, vals };
+  }
+
+  // 赤旗（簡易）
+  function detectRedflags_(){
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const view = ss.getSheetByName('Output_Min_View');
+    if (!view) return [];
+    const H = view.getDataRange().getValues()[0].map(String);
+    const col = part => H.findIndex(h => h.includes(part));
+    const vals = view.getDataRange().getValues();
+
+    const iOCF   = col('営業CF（百万円）');
+    const iEq    = col('自己資本（百万円）') >= 0 ? col('自己資本（百万円）') : col('純資産（百万円）');
+    const iAssets= col('総資産（百万円）');
+    const iNI    = col('当期純利益（百万円）');
+
+    const red = [];
+    if (iOCF >= 0 && vals.length > 3) {
+      const last3 = vals.slice(-3).map(r => Number(r[iOCF]));
+      if (last3.every(x => isFinite(x) && x < 0)) red.push('営業CFマイナスが3期連続');
+    }
+    if (iEq >= 0 && iAssets >= 0 && vals.length > 1) {
+      const last = vals[vals.length-1];
+      const ratio = safeDiv(Number(last[iEq]), Number(last[iAssets]));
+      if (ratio != null && ratio < 0.40) red.push('自己資本比率<40%');
+    }
+    if (iNI >= 0 && vals.length > 1) {
+      const ni = Number(vals[vals.length-1][iNI]);
+      if (isFinite(ni) && ni < 0) red.push('最新期で純損失');
+    }
+    return red;
+  }
+
+  function gradeFromScore_(x){
+    if (x >= GRADE_BANDS.A) return 'A';
+    if (x >= GRADE_BANDS.B) return 'B';
+    if (x >= GRADE_BANDS.C) return 'C';
+    if (x >= GRADE_BANDS.D) return 'D';
+    return 'E';
+  }
+
+  function buildScores_(){
+    // 1) 系列取得
+    const sales  = pickSeries_('Output_Min_View','売上高（百万円）').vals;
+    const op     = pickSeries_('Output_Min_View','営業利益（百万円）').vals;
+    const ratios = (() => {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const s  = ss.getSheetByName('Output_Ratios');
+      if (!s) return { opm:[], roe:[], roa:[], eqRatio:[], fcf:[] };
+      const v = s.getDataRange().getValues();
+      const H = v[0].map(String);
+      const id = name => H.indexOf(name);
+      const io = id('営業利益率'), ir = id('ROE'), ia = id('ROA'), ie = id('自己資本比率'), ifcf = id('FCF（百万円）');
+      const out = { opm:[], roe:[], roa:[], eqRatio:[], fcf:[] };
+      for (let r=1; r<v.length; r++){
+        out.opm.push(Number(v[r][io]));
+        out.roe.push(Number(v[r][ir]));
+        out.roa.push(Number(v[r][ia]));
+        out.eqRatio.push(Number(v[r][ie]));
+        out.fcf.push(Number(v[r][ifcf]));
+      }
+      return out;
+    })();
+
+    // 2) スコア化（5年優先・不足時は3年）
+    const gSales = cagrN(sales, 5) ?? cagrN(sales, 3);
+    const gOp    = cagrN(op,    5) ?? cagrN(op,    3);
+    const scoreGrowth = clip(((gSales||0)+(gOp||0))/2 / 0.20); // 20%で満点
+    const lastRoe = ratios.roe.at(-1) ?? null;
+    const lastOpm = ratios.opm.at(-1) ?? null;
+    const scoreProfit = clip( ((lastRoe||0)/0.20 + (lastOpm||0)/0.20)/2 );
+    const lastEqR = ratios.eqRatio.at(-1) ?? null;
+    const lastRoa = ratios.roa.at(-1) ?? null;
+    const scoreFinancial = clip( 0.7 * clip((lastEqR||0)/0.60) + 0.3 * clip((lastRoa||0)/0.10) );
+
+    // フェーズB簡易：資産/収益バリュー・事業素質・株主重視は中庸
+    const scoreAssetValue=0.5, scoreEarningsVal=0.5, scoreBiz=0.5, scoreShare=0.5;
+
+    const flags = detectRedflags_();
+    let penalty = 0.0;
+    if (flags.some(f=>/自己資本比率/.test(f))) penalty += 0.10;
+    if (flags.some(f=>/営業CFマイナス/.test(f))) penalty += 0.10;
+    if (flags.some(f=>/純損失/.test(f)))       penalty += 0.05;
+    penalty = Math.min(penalty, 0.15);
+
+    const scores = {
+      '資産割安性'  : gradeFromScore_(clip(scoreAssetValue  - penalty)),
+      '収益割安性'  : gradeFromScore_(clip(scoreEarningsVal - penalty)),
+      '財務健全性'  : gradeFromScore_(clip(scoreFinancial   - penalty)),
+      '収益性'      : gradeFromScore_(clip(scoreProfit      - penalty)),
+      '成長性'      : gradeFromScore_(clip(scoreGrowth      - penalty)),
+      '事業素質'    : gradeFromScore_(clip(scoreBiz         - penalty)),
+      '株主重視姿勢': gradeFromScore_(clip(scoreShare       - penalty)),
+    };
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName('Output_Scores') || ss.insertSheet('Output_Scores');
+    const out = [['項目','評点(A-E)']];
+    Object.entries(scores).forEach(([k,v])=> out.push([k,v]));
+    out.push(['赤旗', flags.join(' / ') || '(なし)']);
+    sh.clearContents();
+    sh.getRange(1,1,out.length,out[0].length).setValues(out);
+    sh.setFrozenRows(1);
+    sh.autoResizeColumns(1, out[0].length);
+  }
+
+  if (!EDIPH2.step5_buildScores){
+    EDIPH2.step5_buildScores = buildScores_;
+  }
+})();
+
+
+/*** === Phase2 Runner (Runメニュー用) === ***/
+function Phase2_Step1_ExtendAndRebuild() {
+  EDIPH2.step1_extendAndRebuild();
+}
+
+function Phase2_Step2_BuildView() {
+  // 期末月は必要に応じて変更（例: 12月期なら fiscalMonth: 12）
+  EDIPH2.step2_buildView({ fiscalMonth: 3 });
+}
+
+function Phase2_Step3_BuildRatios() {
+  EDIPH2.step3_buildRatios();
+}
+
+function Phase2_Step4_FillTemplate() {
+  // テンプレシート名を使っているものに合わせる
+  EDIPH2.step4_fillTemplate({ template: 'Report_Template' });
+}
+
+// --- Auto-create template variant (append-only) ---
+(function(){
+  if (!EDIPH2.step4_fillTemplateAuto) {
+    EDIPH2.step4_fillTemplateAuto = function({ template = 'Report_Template' } = {}) {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      // ここでは getOrCreate 相当の動きに変更
+      const sT = ss.getSheetByName(template) || ss.insertSheet(template);
+
+      const sV = ss.getSheetByName('Output_Min_View');
+      const sR = ss.getSheetByName('Output_Ratios');
+      if (!sV || !sR) throw new Error('View または Ratios がまだ生成されていません（Step2/Step3 を実行してください）');
+
+      const vData = sV.getDataRange().getValues();
+      const rData = sR.getDataRange().getValues();
+
+      // A1 に View、A(20) に Ratios（貼付先は必要に応じて変更）
+      sT.getRange(1,1, vData.length, vData[0].length).clearContent().setValues(vData);
+      sT.getRange(20,1, rData.length, rData[0].length).clearContent().setValues(rData);
+    };
+  }
+})();
+
+// --- runner for menu ---
+function Phase2_Step4_FillTemplate_Auto() {
+  EDIPH2.step4_fillTemplateAuto({ template: 'Report_Template' });
+}
+
+
+
+
+// === Phase2: Ratios 用の見出しマッピング対応（append-only） ===
+(function(){
+  // Map シートを読み、{ '売上高': 'Value(num)（百万円）', ... } のような辞書を返す
+  function readKpiHeaderMap_({ sheetName = 'Map' } = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const s = ss.getSheetByName(sheetName);
+    if (!s) return {};
+    const v = s.getDataRange().getValues();
+    // 期待する形: A列=KPI名（標準名）、B列=Output_Min_View上の見出し（完全一致 or 一部一致用の文字列）
+    // 1行目はヘッダ可
+    const map = {};
+    for (let r = 1; r < v.length; r++) {
+      const kpi = String(v[r][0] || '').trim();
+      const hdr = String(v[r][1] || '').trim();
+      if (kpi && hdr) map[kpi] = hdr;
+    }
+    return map;
+  }
+
+  // 既存の buildOutputRatios を差し替えずに「上書き」する（呼び名そのまま）
+  const original = EDIPH2.buildOutputRatios;
+  EDIPH2.buildOutputRatios = function({ sourceViewSheet = 'Output_Min_View', destSheet = 'Output_Ratios' } = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const s  = ss.getSheetByName(sourceViewSheet);
+    if (!s) throw new Error(`${sourceViewSheet} が見つかりません`);
+    const v = s.getDataRange().getValues();
+    if (v.length < 2) { // データ無しなら空の表だけ出す
+      const d = ss.getSheetByName(destSheet) || ss.insertSheet(destSheet);
+      d.clearContents();
+      d.getRange(1,1,1,6).setValues([['FY','営業利益率','ROE','ROA','自己資本比率','FCF（百万円）']]);
+      return;
+    }
+    const header = v[0].map(String);
+    const idx = name => header.indexOf(name);
+
+    // Map 優先で列特定
+    const map = readKpiHeaderMap_();
+    const findByMapOrLike = (stdName, likeCandidates) => {
+      const target = map[stdName];
+      if (target) {
+        // 完全一致 → それでOK、無ければ「含む」一致も試す
+        const iFull = header.indexOf(target);
+        if (iFull >= 0) return iFull;
+        const iPart = header.findIndex(h => h.includes(target));
+        if (iPart >= 0) return iPart;
+      }
+      // フォールバック（従来の“含む”検索）
+      for (const key of likeCandidates) {
+        const i = header.findIndex(h => h.includes(key));
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
+
+    const iFY = idx('FY');
+
+    const iSalesMM  = findByMapOrLike('売上高', ['売上高（百万円）','営業収益（百万円）']);
+    const iOpMM     = findByMapOrLike('営業利益', ['営業利益（百万円）']);
+    const iNIMM     = findByMapOrLike('当期純利益', ['当期純利益（百万円）','親会社株主に帰属する当期純利益（百万円）']);
+    const iEqMM     = findByMapOrLike('自己資本', ['自己資本（百万円）','純資産（百万円）','株主資本（百万円）']);
+    const iAssetsMM = findByMapOrLike('総資産', ['総資産（百万円）','資産合計（百万円）']);
+    const iFCFMM    = findByMapOrLike('フリーキャッシュフロー', ['フリーキャッシュフロー（百万円）']);
+
+    const safeNum = x => (x === '' || x == null) ? NaN : Number(x);
+    const safeDiv = (a,b)=> (isFinite(a)&&isFinite(b)&&b!==0 ? a/b : '');
+
+    const out = [['FY','営業利益率','ROE','ROA','自己資本比率','FCF（百万円）']];
+    for (let r = 1; r < v.length; r++) {
+      const row = v[r];
+      const sales  = iSalesMM  >= 0 ? safeNum(row[iSalesMM])  : NaN;
+      const op     = iOpMM     >= 0 ? safeNum(row[iOpMM])     : NaN;
+      const ni     = iNIMM     >= 0 ? safeNum(row[iNIMM])     : NaN;
+      const eq     = iEqMM     >= 0 ? safeNum(row[iEqMM])     : NaN;
+      const assets = iAssetsMM >= 0 ? safeNum(row[iAssetsMM]) : NaN;
+      const fcf    = iFCFMM    >= 0 ? safeNum(row[iFCFMM])    : NaN;
+
+      out.push([
+        row[iFY],
+        safeDiv(op, sales),
+        safeDiv(ni, eq),
+        safeDiv(ni, assets),
+        safeDiv(eq, assets),
+        isFinite(fcf) ? fcf : ''
+      ]);
+    }
+
+    const d = ss.getSheetByName(destSheet) || ss.insertSheet(destSheet);
+    d.clearContents();
+    d.getRange(1,1,out.length,out[0].length).setValues(out);
+    if (out.length > 1) {
+      d.getRange(2, 2, out.length-1, 4).setNumberFormat('0.0%');
+      d.getRange(2, 6, out.length-1, 1).setNumberFormat('#,##0.0');
+      d.getRange(2, 2, out.length-1, 5).setHorizontalAlignment('right');
+    }
+
+    // 何が足りないかログ出し
+    const missing = [];
+    if (iSalesMM < 0)  missing.push('売上高');
+    if (iOpMM < 0)     missing.push('営業利益');
+    if (iNIMM < 0)     missing.push('当期純利益');
+    if (iEqMM < 0)     missing.push('自己資本/純資産');
+    if (iAssetsMM < 0) missing.push('総資産');
+    if (missing.length) Logger.log('Ratios入力に不足: ' + missing.join(', '));
+  };
+})();
+
+
+
+
+/*** === Phase2: Generic列 → 指定KPIに束ねる（append-only） === ***/
+(function(){
+  // Configシートから “Value(num) を何KPIとして扱うか” を読む
+  // 例: A列=Key, B列=Value として
+  //   GENERIC_VALUE_KPI_NAME | 売上高
+  function readConfigValue_(key, {sheet='Config'}={}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const s = ss.getSheetByName(sheet);
+    if (!s) return null;
+    const v = s.getDataRange().getValues();
+    for (let r=0; r<v.length; r++){
+      const k = String(v[r][0]||'').trim();
+      if (k === key) return String(v[r][1]||'').trim();
+    }
+    return null;
+  }
+
+  // step1 の直前で呼ばれ、Output_Min 内の “Value(num)” を指定KPI名にコピーする
+  function bindGenericValueToKpi_({
+    sourceSheet = 'Output_Min',
+    genericHeader = 'Value(num)',
+    asMillions = false // trueなら百万円換算してコピー
+  } = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const s = ss.getSheetByName(sourceSheet);
+    if (!s) throw new Error(`${sourceSheet} が見つかりません`);
+
+    const rng = s.getDataRange();
+    const vals = rng.getValues();
+    if (vals.length < 2) return;
+
+    const header = vals[0].map(String);
+    // “Value(num)” or “Value(num)（百万円）” のどちらでも拾う
+    const idxGeneric = header.findIndex(h => /Value\(num\)/.test(String(h)));
+    if (idxGeneric < 0) return; // 無ければ何もしない
+
+    // Config から KPI名を読む（未設定なら何もしない）
+    const kpiName = readConfigValue_('GENERIC_VALUE_KPI_NAME');
+    if (!kpiName) return;
+
+    // すでに同名KPI列があれば使い、無ければ末尾に追加
+    let idxKpi = header.indexOf(kpiName);
+    if (idxKpi < 0) {
+      header.push(kpiName);
+      vals[0] = header;
+      idxKpi = header.length - 1;
+      // データ行のために列増設
+      for (let r=1; r<vals.length; r++) vals[r][idxKpi] = '';
+    }
+
+    // 値をコピー（必要に応じて百万円換算）
+    for (let r=1; r<vals.length; r++){
+      const v = vals[r][idxGeneric];
+      if (v === '' || v == null) continue;
+      const num = Number(v);
+      if (!isFinite(num)) continue;
+      vals[r][idxKpi] = asMillions ? (num/1e6) : num;
+    }
+
+    // 反映
+    s.clearContents();
+    s.getRange(1,1,vals.length, vals[0].length).setValues(vals);
+  }
+
+  // 既存ステップの“前処理”として差し込み：ラッパーを上書き
+  const origStep1 = EDIPH2.step1_extendAndRebuild;
+  EDIPH2.step1_extendAndRebuild = function(){
+    // Value(num) を Config 指定のKPI名に束ねる
+    bindGenericValueToKpi_({ sourceSheet: 'Output_Min' });
+    // そのうえで辞書拡張・再構成
+    return origStep1();
+  };
+})();
+
+
+/*** === Phase2: 企業本体の財務XBRLだけを選ぶフィルタ === ***/
+// 企業向けタクソノミ（jpcrp/jppfs）を含むか、投信・臨報だけかを判定
+function isCorporateFinancialXbrl_(text) {
+  // 企業: jpcrp_cor (ディスクロ表紙/本文) / jppfs_cor (財務諸表)
+  // 投信/特定用途: jpsps-* など
+  const t = String(text || '');
+  const hasCorp = /jpcrp[_-]cor|jppfs[_-]cor/i.test(t);
+  const isFund  = /jpsps[-_]/i.test(t);
+  return hasCorp && !isFund;
+}
+
+// 直近から “財務XBRL(企業)” を見つけて抽出 → Output_Min を更新
+function ExtractKPI_CorporateOnly() {
+  const { dateUsed, doc } = findDocWithXbrl(60); // 当日→遡り探索
+  Logger.log('USING DATE: ' + dateUsed + ' / docID=' + doc.docID + ' / ' + (doc.docDescription || ''));
+
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+
+  // 企業の財務XBRLだけを優先して選ぶ
+  let primary = null;
+  for (const f of xbrls) {
+    if (isCorporateFinancialXbrl_(f.text)) { primary = f; break; }
+  }
+  if (!primary) {
+    primary = pickPrimaryInstance(xbrls);
+    Logger.log('WARNING: corporate financial XBRL not found. picked: ' + primary.name);
+  } else {
+    Logger.log('PICKED CORPORATE XBRL: ' + primary.name);
+  }
+
+  // facts / contextMap / unitMap を用意
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+  const { contextMap, unitMap } = buildContextAndUnitMaps_(primary.text);
+
+  // ✅ rows 構築を1行に統一
+  const rows = buildOutputRows_(facts, contextMap, unitMap);
+
+  // Output_Min へ書き出し
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('Output_Min') || ss.insertSheet('Output_Min');
+  sh.clearContents();
+  sh.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, rows[0].length);
+  Logger.log('WROTE KPI rows: ' + (rows.length - 1));
+}
+
+
+// 当日→最大days遡って xbrlFlag=1 の中から “企業財務（jpcrp/jppfs）” を優先選択
+function findDocWithXbrl(days) {
+  const max = days || 60;
+  let d = new Date();
+  for (let i=0;i<=max;i++){
+    const ymd = Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd');
+    const list = EDINET.list(ymd);
+    const docs = (list.results || []).filter(r => r && r.xbrlFlag);
+    // まず「有価証券報告書／決算短信／四半期報告書」を優先
+    const pri = docs.filter(r => /有価証券報告書|決算短信|四半期報告書/.test(r.docDescription||''));
+    const cand = (pri.length ? pri : docs);
+    // 1件ずつ中身を見て “企業財務” を含むか判定
+    for (const doc of cand) {
+      try {
+        const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+        const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+        if (xbrls.some(x => isCorporateFinancialXbrl_(x.text))) {
+          return { dateUsed: ymd, doc };
+        }
+      } catch (e) {
+        // 失敗したら次の候補へ
+        Logger.log('skip docID=' + doc.docID + ' : ' + e);
+      }
+    }
+    // 1日戻る
+    d = new Date(d.getTime() - 24*60*60*1000);
+  }
+  throw new Error('直近で企業財務XBRLが見つかりませんでした。検索幅を広げてください。');
+}
+
+/*** === Patch A: jppfs優先の選択ロジック & 粗探索 === ***/
+function pickCorporateFinancialFile_(xbrls) {
+  if (!Array.isArray(xbrls) || !xbrls.length) return null;
+  // 1) 財務諸表タクソノミ jppfs_cor を最優先
+  const pfs = xbrls.find(f => /jppfs[_-]cor/i.test(f.text || ''));
+  if (pfs) return pfs;
+  // 2) 代表的な財務タグが含まれるファイルを次点で
+  const hasKey = x => /(NetSales|OperatingIncome|ProfitLoss|TotalAssets|NetAssets|CashFlowsFromOperatingActivities)/i.test(x.text||'');
+  const withKeys = xbrls.find(hasKey);
+  if (withKeys) return withKeys;
+  // 3) 最後に従来の優先ロジック
+  return pickPrimaryInstance(xbrls);
+}
+
+/*** === Patch B: KPI候補を少し拡張（IFRS/揺れ対策の語） === ***/
+(function(){
+  if (typeof KPI_PATTERNS === 'object') {
+    KPI_PATTERNS['売上高'] = (KPI_PATTERNS['売上高']||[]).concat([
+      'RevenueFromContractsWithCustomers','RevenueIFRS','SalesRevenue','OperatingRevenue'
+    ]);
+    KPI_PATTERNS['当期純利益'] = (KPI_PATTERNS['当期純利益']||[]).concat([
+      'ProfitLossAttributableToOwnersOfParent','ProfitLossIFRS','NetIncomeLoss'
+    ]);
+  }
+})();
+
+/*** === Patch C: 抽出関数を強化（ログ・探索期間の指定） === ***/
+function ExtractKPI_CorporateOnly_Advanced(daysBack) {
+  // 探索幅の指定（既定 90 日）
+  const { dateUsed, doc } = findDocWithXbrl(Number(daysBack) || 90);
+  Logger.log('USING DATE: ' + dateUsed + ' / ' + (doc.docDescription || '') + ' / docID=' + doc.docID);
+
+  // ZIP → XBRL 展開 → 財務（企業）ファイルを選択
+  const saved  = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls  = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickCorporateFinancialFile_(xbrls);
+  Logger.log('PICKED: ' + (primary && primary.name));
+
+  // facts / context / unit を用意
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+  Logger.log('facts count=' + facts.length);
+  const { contextMap, unitMap } = buildContextAndUnitMaps_(primary.text);
+
+  // ✅ rows 構築を1行に統一
+  const rows = buildOutputRows_(facts, contextMap, unitMap);
+
+  // Output_Min へ書き出し
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('Output_Min') || ss.insertSheet('Output_Min');
+  sh.clearContents();
+  sh.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, rows[0].length);
+  Logger.log('WROTE rows: ' + (rows.length - 1));
+}
+
+/**
+ * EDINET上の会社コード or 名称と年度(YYYY)をもとに
+ * 主要KPI辞書 {key:value,...} を返す最小関数
+ */
+var Edinet = Edinet || {};  // 既存EDINETオブジェクトと共存
+Edinet.fetchXbrlByCodeYear = function(codeOrName, year) {
+  try {
+    // --- 1) EDINETドキュメント探索 ---
+    const { dateUsed, doc } = findDocWithXbrl(90); // 最大90日遡る
+    if (!doc) throw new Error('XBRL書類が見つかりませんでした。');
+
+    // --- 2) ZIPダウンロード＆解凍 ---
+    const saved  = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+    const xbrls  = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+    const primary = pickBestInstance_(xbrls);  // jppfs_cor最優先
+    if (!primary) throw new Error('インスタンスXBRLが見つかりません。');
+
+    // --- 3) facts抽出 ---
+    const { facts } = parseFactsFromXbrlText_(primary.text);
+    const { contextMap, unitMap } = buildContextAndUnitMaps_(primary.text);
+
+    // --- 4) 指定年度(YYYY)に対応する値を辞書化 ---
+    const kpiNames = ['売上高','営業利益','当期純利益','総資産','純資産','営業CF','投資CF','財務CF'];
+    const result = {};
+    kpiNames.forEach(kpi => {
+      const hits = matchFactsByKpi_(facts, kpi);
+      const byYear = {};
+      hits.forEach(f => {
+        const y = yearKeyOfFact_(f, contextMap);
+        if (!y) return;
+        if (!byYear[y]) byYear[y] = [];
+        byYear[y].push(f);
+      });
+      const list = byYear[year] || [];
+      if (list.length) {
+        const best = list[0];
+        const n = normalizeFact_(best, contextMap, unitMap);
+        result[kpi] = n.valueNum;
+      }
+    });
+
+    return result;  // Code.gs 側で pickFirstAvailableNormalized_ に渡される
+  } catch (e) {
+    Logger.log('fetchXbrlByCodeYear error: ' + e);
+    return {};  // 失敗時は空辞書
+  }
+};
+
+/*** デバッグ用：選ばれたXBRLの上位localNameを覗く ***/
+function Debug_DumpPickedFinancialFactsTop() {
+  const { dateUsed, doc } = findDocWithXbrl(90);
+  const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName||'UNKNOWN'}`);
+  const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickCorporateFinancialFile_(xbrls);
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+  const freq = {};
+  facts.forEach(f => { freq[f.localName] = (freq[f.localName]||0)+1; });
+  const top = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,50);
+  Logger.log('TOP localNames:\n' + top.map(([k,v])=>`${k} : ${v}`).join('\n'));
+}
+
+/*** === Fix: 企業のインスタンスXBRLを“見つかるまで”探索して抽出 === ***/
+
+// 投信・臨報などを docDescription で除外（必要なら語を追加）
+function isCorporateDocMeta_(doc) {
+  const desc = String(doc.docDescription || '');
+  const isWantedType = /有価証券報告書|決算短信|四半期報告書/.test(desc);
+  const isFund       = /投資信託|内国投資信託|受益証券/i.test(desc);
+  return isWantedType && !isFund;
+}
+
+// インスタンス文書かどうか（リンクベースを除外）
+function isInstanceFileName_(name) {
+  const lower = String(name || '').toLowerCase();
+  if (!/\.xbrl$|\.xml$/.test(lower)) return false;
+  if (/_(pre|cal|lab|def)\.xml$/.test(lower)) return false; // リンクベース除外
+  if (/manifest/i.test(lower)) return false;
+  return true;
+}
+
+// “企業財務”の本文か判定（タクソノミ判定）
+function includesCorporateFinancialTaxonomy_(text) {
+  const t = String(text || '');
+  const hasCorp = /jppfs[_-]cor|jpcrp[_-]cor/i.test(t); // 企業PFS/CRP
+  const isFund  = /jpsps[-_]/i.test(t);                 // 投信
+  return hasCorp && !isFund;
+}
+
+// 最有力インスタンスを選ぶ: jppfs_cor最優先→企業タクソノミ→その他
+function pickBestInstance_(files) {
+  // 1) インスタンス候補のみに絞る
+  const inst = files.filter(f => isInstanceFileName_(f.name));
+  // 2) jppfs_cor 最優先
+  const pfs = inst.find(f => /jppfs[_-]cor/i.test(f.text));
+  if (pfs) return pfs;
+  // 3) 企業タクソノミを含むもの
+  const corp = inst.find(f => includesCorporateFinancialTaxonomy_(f.text));
+  if (corp) return corp;
+  // 4) 最後の保険
+  return inst[0] || files[0] || null;
+}
+
+/**
+ * 当日から daysBack 日さかのぼり、
+ * 企業向けの“インスタンスXBRL”が見つかるまで狩り続けて Output_Min を作る。
+ */
+/**
+ * 当日から daysBack 日さかのぼり、
+ * 企業向けの“インスタンスXBRL”が見つかるまで狩り続けて Output_Min を作る（四半期優先は USE_QUARTERLY_MODE 依存）。
+ */
+function ExtractKPI_AutoHunt(daysBack, { edinetCode=null, filerName=null } = {}) {
+  const max = Number(daysBack) || 180;
+  let d = new Date();
+
+  const matchTarget = (doc) => {
+    if (edinetCode && String(doc.edinetCode||'') !== String(edinetCode)) return false;
+    if (filerName && !String(doc.filerName||'').includes(String(filerName))) return false;
+    return true;
+  };
+
+  for (let i = 0; i <= max; i++) {
+    const ymd = Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd');
+    try {
+      const list = EDINET.list(ymd);
+      const docs = (list.results || [])
+        .filter(r => r && r.xbrlFlag && isCorporateDocMeta_(r))
+        .filter(matchTarget); // ★ 指定会社だけに絞る
+
+      for (const doc of docs) {
+        try {
+          Logger.log('TRY: ' + ymd + ' / ' + (doc.docDescription || '') + ' / docID=' + doc.docID);
+
+          const saved = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+          const xbrls = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+
+          const primary = pickBestInstance_(xbrls);
+          if (!primary) continue;
+          if (!includesCorporateFinancialTaxonomy_(primary.text)) continue;
+
+          const { facts } = parseFactsFromXbrlText_(primary.text);
+          if (!facts.length) continue;
+
+          const { contextMap, unitMap } = buildContextAndUnitMaps_(primary.text);
+          const rows = buildOutputRows_(facts, contextMap, unitMap);
+
+          const ss = SpreadsheetApp.getActiveSpreadsheet();
+          const sh = ss.getSheetByName('Output_Min') || ss.insertSheet('Output_Min');
+          sh.clearContents();
+          sh.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+          sh.setFrozenRows(1);
+          sh.autoResizeColumns(1, rows[0].length);
+
+          Logger.log(`SUCCESS: ${doc.filerName} (${doc.edinetCode}) / ${ymd}`);
+          return; // 1件見つけたら終了
+        } catch (eDoc) {
+          Logger.log('  doc error: ' + eDoc);
+        }
+      }
+    } catch (eDay) {
+      Logger.log('day error: ' + eDay);
+    }
+    d = new Date(d.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  throw new Error('指定会社のインスタンスXBRLが見つかりませんでした。期間を広げるか指定を見直してください。');
+}
+
+
+/**
+ * 直近から企業財務のインスタンスXBRLを拾い、
+ * 主要KPIを“縦持ち”で facts_tidy に追記する。
+ */
+function Extract_ToFactsTidy_FromLatest(){
+  // 1) ドキュメント探索（既存ロジックを流用）
+  const { dateUsed, doc } = findDocWithXbrl(90);
+  const saved  = EDINET.downloadZipWithId(doc.docID, `${doc.docID}_${doc.filerName || 'UNKNOWN'}`);
+  const xbrls  = EDINET.unzipXbrlTextsFromFileId(saved.fileId);
+  const primary = pickBestInstance_(xbrls); // jppfs_cor 最優先版
+
+  // 2) 事実・文脈
+  const { facts } = parseFactsFromXbrlText_(primary.text);
+  const { contextMap, unitMap } = buildContextAndUnitMaps_(primary.text);
+
+  // 3) 概念インデックス＆抽出
+  const idx = buildConceptIndex_(facts);
+  const want = Object.keys(METRIC_DICT);
+  const tidyRows = [];
+  for (const k of want){
+    const fact = pickBestFact_(idx, METRIC_DICT[k], contextMap);
+    if (!fact) continue;
+    const n = normalizeFact_(fact, contextMap, unitMap); // ← fiscalYear/quarter/qLabel を含む
+    // context の型別に periodStart/End を拾う
+    const c = contextMap[fact.attrs.contextRef || ''];
+    const p = (c && c.period) || {type:'unknown'};
+    const start = p.type === 'duration' ? (p.start || '') : '';
+    const end   = p.type === 'duration' ? (p.end   || '') : (p.instant || '');
+    const periodType = p.type;
+
+    tidyRows.push([
+      doc.edinetCode || '',            // edinetCode
+      doc.filerName || '',             // filerName
+      doc.docID || '',                 // docId
+      '',                              // accountingStd（後で IF：IFRS 判定を追加可）
+      'CON',                           // consolidated（暫定：連結前提。必要なら context から精査）
+      periodType,                      // periodType
+      start,                           // periodStart
+      end,                             // periodEnd
+      n.fiscalYear,                    // fiscalYear
+      n.quarter,                       // quarter
+      n.qLabel,                        // qLabel
+      k,                               // concept（KPI名）
+      n.valueNum,                      // valueNum
+      n.unitText,                      // unitText
+      n.decimals,                      // decimals
+      n.contextRef,                    // contextRef
+      n.unitRef,                       // unitRef
+      new Date()                       // createdAt
+    ]);
+  }
+
+  // 4) 書き込み
+  writeFactsTidy_(tidyRows, 'facts_tidy');
+
+  // 5) おまけ：Output_Min へも従来形で出したい場合は再利用
+  // const rowsWide = buildOutputRows_(facts, contextMap, unitMap);
+  // EDIPH2.S.clearAndSetValues(EDIPH2.S.getOrCreateSheet('Output_Min'), rowsWide);
+
+  Logger.log('facts_tidy appended rows: ' + tidyRows.length + ' (date=' + dateUsed + ', filer=' + (doc.filerName||'') + ')');
+}
+
+// ====== facts_tidy のセルフチェック（置き換え版） ======
+function verify_facts_tidy_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName('facts_tidy');
+  if (!sh) throw new Error('シート facts_tidy が見つかりません。まず Extract_ToFactsTidy_FromLatest を実行して作成してください。');
+  if (sh.getLastRow() < 2) throw new Error('facts_tidy にデータがありません。まず Extract_ToFactsTidy_FromLatest を実行。');
+
+  const rng = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn());
+  const v = rng.getValues();
+
+  // ヘッダの正規化（前後空白除去）
+  const header = v[0].map(h => String(h || '').trim());
+  const H = Object.fromEntries(header.map((h, i) => [h, i]));
+
+  // 必須列の確認
+  const REQUIRED = ['edinetCode','filerName','docId','periodEnd','fiscalYear','concept','valueNum'];
+  const missing = REQUIRED.filter(k => H[k] == null);
+  if (missing.length) {
+    Logger.log('ヘッダ: ' + JSON.stringify(header));
+    throw new Error('必須列が見つかりません: ' + missing.join(', '));
+  }
+
+  // 走査
+  let nRows = v.length - 1;
+  let nMissingKey = 0;      // docId / concept 欠損
+  let nMissingPeriod = 0;   // periodEnd / fiscalYear 欠損
+  let nNonNumeric = 0;      // valueNum が数値でない
+  let nZeros = 0;           // valueNum が 0（任意チェック）
+  let nFutureDates = 0;     // 未来日periodEnd（誤判定検知用）
+  const dupSet = new Set(); // (docId,concept,periodEnd) 重複
+
+  // 今日（JST基準）の日付文字列
+  const todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  const todayNum = Number(todayStr.replace(/-/g, ''));
+
+  for (let r = 1; r < v.length; r++) {
+    const row = v[r];
+
+    const docId      = String(row[H['docId']] || '').trim();
+    const concept    = String(row[H['concept']] || '').trim();
+    const periodEnd  = String(row[H['periodEnd']] || '').trim();
+    const fiscalYear = String(row[H['fiscalYear']] || '').trim();
+    const valRaw     = row[H['valueNum']];
+    const valNum     = (valRaw === '' || valRaw == null) ? NaN : Number(valRaw);
+
+    if (!docId || !concept) nMissingKey++;
+    if (!periodEnd || !fiscalYear) nMissingPeriod++;
+    if (!isFinite(valNum)) nNonNumeric++;
+    if (isFinite(valNum) && valNum === 0) nZeros++;
+
+    // 未来日チェック（誤ったinstant/endDate混入の検知）
+    if (periodEnd) {
+      const peNum = Number(periodEnd.replace(/[^\d]/g, ''));
+      if (isFinite(peNum) && peNum > todayNum) nFutureDates++;
+    }
+
+    // 重複キー（docId+concept+periodEnd）検知
+    const key = [docId, concept, periodEnd].join('||');
+    if (dupSet.has(key)) {
+      // 重複はログに個別出し（件数増えるなら控えめに）
+      Logger.log('DUP: ' + key + '  (row=' + (r+1) + ')');
+    } else {
+      dupSet.add(key);
+    }
+  }
+
+  Logger.log(
+    'facts_tidy rows=' + nRows +
+    ' / 欠損(docId|concept)=' + nMissingKey +
+    ' / 欠損(periodEnd|fiscalYear)=' + nMissingPeriod +
+    ' / 非数valueNum=' + nNonNumeric +
+    ' / valueNum=0件数=' + nZeros +
+    ' / 未来periodEnd件数=' + nFutureDates
+  );
+}
+
+// ====== 実行メニュー用（メニューに出したい場合はこれを実行） ======
+function Run_Verify_Facts_Tidy() {
+  verify_facts_tidy_();
+}
+
+function Phase2_Step5_BuildScores() {
+  EDIPH2.step5_buildScores();
+}
+/** ========= Phase2_Step6: フルレポート生成 =========
+ *  1) 直近の企業XBRLを自動探索→Output_Min
+ *  2) 辞書拡張・再構成（Step1）
+ *  3) View生成（FY/百万円, Step2）
+ *  4) 指標シート作成（Step3）
+ *  5) テンプレ貼付（Step4）
+ *  6) 人間味コメントを差し込み
+ */
+function Phase2_Step6_BuildFullReport() {
+  const ui = SpreadsheetApp.getUi();
+  const t0 = Date.now();
+  try {
+    // 期末月は Config!A:B に FISCAL_MONTH | 3 のように入れておけば利用、無ければ 3 月期。
+    const fiscalMonth = (function readFiscalMonth_(){
+      const ss = SpreadsheetApp.getActive();
+      const sh = ss.getSheetByName('Config');
+      if (!sh) return 3;
+      const v = sh.getDataRange().getValues();
+      for (let r=0; r<v.length; r++){
+        if (String(v[r][0]).trim().toUpperCase() === 'FISCAL_MONTH') {
+          const n = Number(v[r][1]);
+          return (isFinite(n) && n>=1 && n<=12) ? n : 3;
+        }
+      }
+      return 3;
+    })();
+
+    ui.alert('XBRL探索を始めます。少しだけお茶でもどうぞ。');
+
+    // 1) 直近から“企業財務”XBRLを狩って Output_Min を作成
+    ExtractKPI_AutoHunt(180);                  // 最大180日遡り
+
+    // 2)-4) 再構成 → View → 指標
+    EDIPH2.step1_extendAndRebuild();
+    EDIPH2.step2_buildView({ fiscalMonth });
+    EDIPH2.step3_buildRatios();
+
+    // 5) テンプレ貼り付け（シートが無ければ自動作成）
+    EDIPH2.step4_fillTemplateAuto({ template: 'Report_Template' });
+
+    // 6) “人間味コメント”を追加
+    writeAutoComments_({ template: 'Report_Template' });
+
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    ui.alert(`レポート生成が完了しました。（所要 ${secs} 秒）\nテンプレシート「Report_Template」をご確認ください。`);
+  } catch (e) {
+    ui.alert('エラーが出ました：\n' + (e && e.message ? e.message : e));
+    throw e;
+  }
+}
+/** ===== 自動コメント挿入（人間味ver） =====
+ * Report_Template に “ざっくり要約コメント” を追記します。
+ * 既存表の右側の空き列に書き込み、折返し＆幅調整します。
+ */
+function writeAutoComments_({
+  template = 'Report_Template',
+  view     = 'Output_Min_View',
+  ratios   = 'Output_Ratios',
+  scores   = 'Output_Scores'
+} = {}) {
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sT = ss.getSheetByName(template) || ss.insertSheet(template);
+  const sV = ss.getSheetByName(view);
+  const sR = ss.getSheetByName(ratios);
+  const sS = ss.getSheetByName(scores);
+
+  if (!sV || !sR) throw new Error('View か Ratios が見つかりません。（Step2/Step3 実行後にお願いします）');
+
+  const V = sV.getDataRange().getValues();
+  const Hv = V[0].map(String);
+  const idxV = (frag)=> Hv.findIndex(h => h.indexOf(frag) >= 0);
+  const iFY = Hv.indexOf('FY');
+
+  const pickSeries = (frag) => {
+    const i = idxV(frag);
+    if (i < 0) return { fy:[], vals:[] };
+    const fy=[], vals=[];
+    for (let r=1; r<V.length; r++){
+      if (!V[r][iFY]) continue;
+      fy.push(String(V[r][iFY]));
+      const num = Number(V[r][i]);
+      vals.push(isFinite(num) ? num : NaN);
+    }
+    return { fy, vals };
+  };
+
+  // シリーズ取得
+  const sales = pickSeries('売上高（百万円）');
+  const op    = pickSeries('営業利益（百万円）');
+
+  // Ratios
+  const R = sR.getDataRange().getValues();
+  const Hr = R[0].map(String);
+  const idR = (name)=> Hr.indexOf(name);
+  const latest = (colName) => {
+    const i = idR(colName);
+    if (i < 0 || R.length < 2) return null;
+    const v = Number(R[R.length-1][i]);
+    return isFinite(v) ? v : null;
+  };
+  const opm     = latest('営業利益率');      // 比率（0-1）
+  const roe     = latest('ROE');
+  const roa     = latest('ROA');
+  const eqRatio = latest('自己資本比率');
+  const fcf     = latest('FCF（百万円）');
+
+  // Scores（あれば使う）
+  let grades = {};
+  if (sS) {
+    const S = sS.getDataRange().getValues();
+    for (let r=1; r<S.length; r++){
+      const k = String(S[r][0]||'').trim();
+      const v = String(S[r][1]||'').trim();
+      if (k) grades[k] = v;
+    }
+  }
+
+  // ミニ関数
+  const cagr = (arr, yearsWanted=5) => {
+    const xs = arr.filter(x => isFinite(x) && x > 0);
+    if (xs.length < 2) return null;
+    const use = xs.slice(-Math.max(2, Math.min(yearsWanted, xs.length)));
+    const first = use[0], last = use[use.length-1];
+    const n = use.length - 1;
+    return Math.pow(last/first, 1/n) - 1;
+  };
+  const pct = (x, d=1) => (x==null? '—' : (x*100).toFixed(d) + '%');
+  const nfmt = (x, d=1) => (x==null? '—' : Utilities.formatString('%,.1f', x));
+
+  const gSales = cagr(sales.vals, 5) ?? cagr(sales.vals, 3);
+  const gOp    = cagr(op.vals,    5) ?? cagr(op.vals,    3);
+
+  const fyLatest = sales.fy.length ? sales.fy[sales.fy.length-1] : '';
+
+  // トーンを控えめに分岐
+  const tone = (() => {
+    const pick = k => grades[k] || '';
+    const strong = ['A','B'];
+    const weak   = ['D','E'];
+    const good = [pick('成長性'), pick('収益性'), pick('財務健全性')].filter(x => strong.includes(x)).length;
+    const bad  = [pick('成長性'), pick('収益性'), pick('財務健全性')].filter(x => weak.includes(x)).length;
+    if (good >= 2 && bad === 0) return '前向き';
+    if (bad  >= 2)             return '慎重';
+    return '中立';
+  })();
+
+  const lines = [];
+  lines.push('【自動コメント（ざっくり要約）】');
+  if (fyLatest) lines.push(`対象期: ${fyLatest}`);
+
+  // 成長性
+  lines.push(`・成長性：売上CAGR ${pct(gSales)}、営業利益CAGR ${pct(gOp)}。評点は「${grades['成長性']||'—'}」。`);
+  // 収益性
+  lines.push(`・収益性：最新の営業利益率 ${pct(opm)}、ROE ${pct(roe)}、ROA ${pct(roa)}。評点は「${grades['収益性']||'—'}」。`);
+  // 財務
+  lines.push(`・財務健全性：自己資本比率 ${pct(eqRatio)}、FCF ${nfmt(fcf)} 百万円。評点は「${grades['財務健全性']||'—'}」。`);
+  // ひとこと
+  if (tone === '前向き') {
+    lines.push('・ひとこと：エンジンは温まってます。足腰（財務）も悪くないので、次は投資配分の巧拙が勝負どころ。');
+  } else if (tone === '慎重') {
+    lines.push('・ひとこと：今は無理せず。収益の質（継続的な利益と現金創出）をもう一歩積み上げたい局面。');
+  } else {
+    lines.push('・ひとこと：良し悪しが混在。強みを伸ばしつつ、弱い指標は一度分解して要因確認が吉。');
+  }
+
+  // 書き込み先：既存表の右に2列空けて配置
+  const startCol = sT.getLastColumn() + 2;
+  const startRow = 1;
+  const block = lines.map(s => [s]);
+  const range = sT.getRange(startRow, startCol, block.length, 1);
+  range.setValues(block);
+  range.setWrap(true);
+  sT.setColumnWidth(startCol, 420);
+}
+/** ========= Phase3: 会社指定実行＆履歴管理 ========= **/
+
+// Configシート1行目の「会社名」「EDINETコード」で対象を指定して実行
+function Phase3_RunByConfig() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = ss.getSheetByName('Config');
+  if (!cfg) throw new Error('Configシートがありません');
+  const v = cfg.getDataRange().getValues();
+  if (v.length < 2) throw new Error('Configに会社行を追加してください');
+
+  const name = String(v[1][0] || '').trim();   // 会社名
+  const code = String(v[1][1] || '').trim();   // EDINETコード
+  if (!name && !code) throw new Error('会社名またはEDINETコードを入力してください');
+
+  Logger.log('指定会社: ' + (name || code));
+
+  const ui = SpreadsheetApp.getUi();
+  ui.alert(`会社「${name || code}」の最新XBRLを探索します。`);
+
+  // --- 最新の企業財務XBRLを探索して Output_Min を作成 ---
+  ExtractKPI_AutoHunt(180);  // 最大180日遡りで自動抽出
+
+  // --- 再構成・ビュー・比率・テンプレ貼付・コメント ---
+  EDIPH2.step1_extendAndRebuild();
+  EDIPH2.step2_buildView({ fiscalMonth: 3 });
+  EDIPH2.step3_buildRatios();
+  EDIPH2.step4_fillTemplateAuto({ template: 'Report_Template' });
+  writeAutoComments_({ template: 'Report_Template' });
+
+  // --- Drive保存＋履歴記録 ---
+  const result = saveReportToDriveAndLog_({ company: name || code });
+
+  ui.alert(
+    `レポート生成完了。\n\n会社: ${name || code}\n保存ファイル: ${result.fileName}\n\nDriveリンクを開くとPDFを確認できます。`
+  );
+}
+
+/** ===== Drive保存＋履歴シート追記 ===== */
+function saveReportToDriveAndLog_({ company }) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('Report_Template');
+  if (!sh) throw new Error('Report_Template が見つかりません');
+
+  // --- PDF化して Drive に保存 ---
+  const blob = sh.getParent().getAs('application/pdf');
+  const folder = DriveApp.getFolderById('1RQJTnK7j2sacUD3Ep-ebrqn9DcGB9jzk'); // あなたの指定フォルダ
+  const ts = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd_HHmm');
+  const fileName = `${company}_Report_${ts}.pdf`;
+  const file = folder.createFile(blob).setName(fileName);
+
+  // --- 履歴シート（Log）に追記 ---
+  const log = ss.getSheetByName('Log') || ss.insertSheet('Log');
+  if (log.getLastRow() === 0) {
+    log.appendRow(['日時','会社','ファイル名','URL']);
+  }
+  const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+  log.appendRow([now, company, fileName, file.getUrl()]);
+
+  Logger.log(`PDF保存: ${fileName} / ${file.getUrl()}`);
+  return { fileName, url: file.getUrl() };
+}
