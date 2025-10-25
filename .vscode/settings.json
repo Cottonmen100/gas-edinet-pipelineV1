@@ -1,0 +1,18 @@
+{
+    "eslint.validate": [
+        "javascript"
+    ],
+    "eslint.workingDirectories": [
+        {
+            "mode": "auto"
+        }
+    ],
+    "editor.codeActionsOnSave": {
+        "source.fixAll.eslint": "always"
+    }, // ←これが自動修正ON
+    "editor.formatOnSave": true,
+    "eslint.useFlatConfig": true,
+    "files.associations": {
+        "*.gs": "javascript"
+    }
+}
